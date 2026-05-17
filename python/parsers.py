@@ -5,33 +5,6 @@ Parsers for the fccanalysis sub-commands
 import argparse
 
 
-def setup_init_parser(parser):
-    '''
-    Arguments for the init sub-command
-    '''
-    init_args = parser.add_argument_group('Init arguments')
-
-    init_args.add_argument('package',
-                           help='name of the analysis package to be built')
-    init_args.add_argument('--name',
-                           default='DummyAnalysis',
-                           help='name of the main analysis utility')
-    init_args.add_argument(
-        '--author',
-        help="author's \"name <email@address>\" (will use git-config if not "
-             "specified)")
-    init_args.add_argument('--description',
-                           help='analysis package description')
-    init_args.add_argument(
-        '--standalone',
-        action='store_true',
-        default=False,
-        help='also add CMake directive to build standalone package')
-    init_args.add_argument(
-        '--output-dir',
-        help='output directory where the analysis package will be written')
-
-
 def setup_build_parser(parser):
     '''
     Arguments for the build sub-command
@@ -83,6 +56,7 @@ def setup_test_parser(parser):
     )
 
 
+# _____________________________________________________________________________
 def setup_pin_parser(parser):
     '''
     Arguments for the pin sub-command
@@ -102,42 +76,184 @@ def setup_pin_parser(parser):
                           help='show pinned stack')
 
 
+# _____________________________________________________________________________
+def setup_submit_parser(parser):
+    '''
+    Define command line arguments for the submit sub-command.
+    '''
+    parser.add_argument('anascript_path',
+                        type=str,
+                        help='path to the analysis script')
+    parser.add_argument('-w', '--where',
+                        type=str,
+                        choices=['ht-condor', 'slurm', 'grid'],
+                        default='ht-condor',
+                        help='where to submit the analysis')
+    parser.add_argument('remaining', nargs=argparse.REMAINDER)
+
+
+# _____________________________________________________________________________
 def setup_run_parser(parser):
     '''
     Define command line arguments for the run sub-command.
     '''
-    parser.add_argument('anascript_path',
-                        help='path to analysis script')
-    parser.add_argument('--files-list', default=[], nargs='+',
-                        help='specify input file(s) to bypass the processList')
     parser.add_argument(
-        '--output',
+        'anascript_path',
+        help='path to analysis script'
+    )
+    parser.add_argument(
+        '--output-dir',
         type=str,
-        default='output.root',
-        help='specify output file name to bypass the processList and or '
-             'outputList')
-    parser.add_argument('--nevents', type=int, default=-1,
-                        help='specify max number of events to process')
-    parser.add_argument('--test', action='store_true', default=False,
-                        help='run over the test input file')
-    parser.add_argument('--bench', action='store_true', default=False,
-                        help='output benchmark results to a JSON file')
-    parser.add_argument('-j', '--ncpus', type=int, default=-1,
-                        help='set number of threads')
-    parser.add_argument('-g', '--graph', action='store_true', default=False,
-                        help='generate computational graph of the analysis')
-    parser.add_argument('--graph-path', type=str, default='',
-                        help='analysis graph save path, should end with '
-                        '\'.dot\' or \'.png\'')
+        default=None,
+        help='global output directory'
+    )
+    parser.add_argument(
+        '-j', '--ncpus', '--n-threads',
+        type=int,
+        default=None,
+        help='set number of threads to run in'
+    )
+    parser.add_argument(
+        '-a', '--analysis-name',
+        type=str,
+        default=None,
+        help='analysis name, mostly used for the output path'
+    )
+
+    # File-path rewrites
+    filepath_rewrites_group = parser.add_mutually_exclusive_group()
+    filepath_rewrites_group.add_argument(
+        '--apply-filepath-rewrites',
+        action='store_true',
+        default=None,
+        help='Apply path rewrites for files stored on shared file systems',
+        dest='apply_filepath_rewrites'
+    )
+    filepath_rewrites_group.add_argument(
+        '--no-filepath-rewrites',
+        action='store_false',
+        default=None,
+        help='Do not apply path rewrites for files stored on shared file '
+             'systems',
+        dest='apply_filepath_rewrites'
+    )
+
+    # Independent sample
+    independent_sample_group = parser.add_argument_group('Independent sample')
+    independent_sample_group.add_argument(
+        '-i', '--input',
+        default=None,
+        nargs='+',
+        metavar='INPUT_FILE',
+        help='location(s) of the input ROOT file(s)'
+    )
+    independent_sample_group.add_argument(
+        '--files-list',
+        default=None,
+        nargs='+',
+        metavar='INPUT_FILE',
+        help='[DEPRECATED] location(s) of the input ROOT file(s)'
+    )
+    independent_sample_group.add_argument(
+        '-f', '--input-file-list',
+        type=str,
+        default=None,
+        metavar='LIST_FILE',
+        help='location of the text file containing list of input ROOT files'
+    )
+    parser.add_argument(
+        '-o', '--output',
+        type=str,
+        default=None,
+        metavar='OUTPUT_FILE',
+        help='directly sets location of the output ROOT file'
+    )
+    independent_sample_group.add_argument(
+        '-s', '--sample-name',
+        type=str,
+        default=None,
+        help='sample name, mostly used for the output path'
+    )
+    independent_sample_group.add_argument(
+        '--n-chunks',
+        type=int,
+        default=None,
+        help='number of output chunks'
+    )
+    parser.add_argument(
+        '--nevents', '--n-events',
+        type=int,
+        default=None,
+        help='specify max number of events to process'
+    )
+    parser.add_argument(
+        '--stride',
+        type=int,
+        default=None,
+        help='specify how to stride through the events'
+    )
+
+    # Testing
+    test_group = parser.add_argument_group('Tests and benchmarking')
+    test_group.add_argument(
+        '--test',
+        action='store_true',
+        default=None,
+        help='run over the test input file'
+    )
+    test_group.add_argument(
+        '--test-file',
+        type=str,
+        default=None,
+        help='test file to use'
+    )
+
+    test_group.add_argument(
+        '--bench',
+        action='store_true',
+        default=False,
+        help='save benchmark results to a JSON file'
+    )
+
+    # Graph
+    graph_group = parser.add_argument_group('Graph production')
+    graph_group.add_argument(
+        '-g', '--graph',
+        action='store_true',
+        default=None,
+        help='generate computational graph of the analysis'
+    )
+    graph_group.add_argument(
+        '--graph-path',
+        type=str,
+        default=None,
+        help='analysis graph save path, should end with \'.dot\' or \'.png\''
+    )
+
+    # Data source
     parser.add_argument(
         '--use-data-source', action='store_true', default=False,
         help='use EDM4hep RDataSource to construct dataframe')
 
-    # Internal argument, not to be used by the users
-    parser.add_argument('--batch', action='store_true', default=False,
-                        help=argparse.SUPPRESS)
+    # Progress bar
+    progressbar_group = parser.add_mutually_exclusive_group()
+    progressbar_group.add_argument(
+        '-p', '--progress-bar',
+        action='store_true',
+        default=None,
+        help='Show a progress bar during the execution',
+        dest='progress_bar'
+    )
+    progressbar_group.add_argument(
+        '--no-progress-bar',
+        action='store_false',
+        default=None,
+        help='Do not show a progress bar during the execution',
+        dest='progress_bar'
+    )
 
 
+# _____________________________________________________________________________
 def setup_run_parser_final(parser):
     '''
     Define command line arguments for the final sub-command.
@@ -149,8 +265,14 @@ def setup_run_parser_final(parser):
     parser.add_argument('--graph-path', type=str, default='',
                         help='analysis graph save path, should end with '
                         '\'.dot\' or \'.png\'')
+    parser.add_argument(
+        '-w', '--do-weighted',
+        action='store_true', default=None,
+        help='whether to use sum of weights to scale the results'
+    )
 
 
+# _____________________________________________________________________________
 def setup_run_parser_plots(parser):
     '''
     Define command line arguments for the plots sub-command.
@@ -172,6 +294,7 @@ def setup_run_parser_plots(parser):
                         help='maximal y position of the legend')
 
 
+# _____________________________________________________________________________
 def setup_run_parser_combine(parser):
     '''
     Define command line arguments for the combine sub-command.
@@ -180,42 +303,42 @@ def setup_run_parser_combine(parser):
 
 
 # _____________________________________________________________________________
-def setup_subparsers(subparsers):
+def setup_subparsers(topparser):
     '''
     Sets all sub-parsers for all sub-commands
     '''
 
-    # Create sub-parsers
-    parser_init = subparsers.add_parser(
-        'init',
-        help="generate a RDataFrame based FCC analysis")
-    parser_build = subparsers.add_parser(
+    # Instantiate sub-parsers
+    parser_build = topparser.add_parser(
         'build',
         help='build and install local analysis')
-    parser_test = subparsers.add_parser(
+    parser_test = topparser.add_parser(
         'test',
         help='test whole or a part of the analysis framework')
-    parser_pin = subparsers.add_parser(
+    parser_pin = topparser.add_parser(
         'pin',
         help='pin fccanalyses to the current version of Key4hep stack')
-    parser_run = subparsers.add_parser(
+    parser_submit = topparser.add_parser(
+        'submit',
+        help="submit the analysis to be run on a remote machine(s)")
+    parser_run = topparser.add_parser(
         'run',
         help="run a RDataFrame based FCC analysis")
-    parser_run_final = subparsers.add_parser(
+    parser_run_final = topparser.add_parser(
         'final',
         help="run a RDataFrame based FCC analysis final configuration")
-    parser_run_plots = subparsers.add_parser(
+    parser_run_plots = topparser.add_parser(
         'plots',
         help="run a RDataFrame based FCC analysis plot configuration")
-    parser_run_combine = subparsers.add_parser(
+    parser_run_combine = topparser.add_parser(
         'combine',
         help="prepare combine cards to run basic template fits")
 
     # Register sub-parsers
-    setup_init_parser(parser_init)
     setup_build_parser(parser_build)
     setup_test_parser(parser_test)
     setup_pin_parser(parser_pin)
+    setup_submit_parser(parser_submit)
     setup_run_parser(parser_run)
     setup_run_parser_final(parser_run_final)
     setup_run_parser_plots(parser_run_plots)

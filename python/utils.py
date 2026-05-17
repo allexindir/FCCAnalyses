@@ -1,137 +1,92 @@
-import uproot
-import glob
-import pandas as pd
-from tqdm import tqdm
-import numpy as np
-import awkward as ak
-import ROOT
-#import seaborn as sns
-import matplotlib.pyplot as plt
-import xgboost as xgb
-from sklearn import metrics
-from sklearn.metrics import roc_curve, auc
-from xgboost import plot_importance
-#from hyperopt import hp
+'''
+RDataFrame or other helpers.
+'''
 
-from math import sqrt, log, fabs
-
-def get_df(root_file_name, branches):
-  
-  file = uproot.open(root_file_name)
-  tree = file['events']
-
-  #Load event-level vars
-  print("Converting to awkward array")
-  if len(file) == 0:
-    return pd.DataFrame()
-  df = tree.arrays(library="pd", how="zip", filter_name=branches)
-  
-  return df
-
-def Z0(S, B):
-  if B<=0:
-    return -100
-  return sqrt(2*((S+B)*log(1+S/B)-S))
-
-def Zmu(S, B):
-  if B<=0:
-    return -100
-  return sqrt(2*(S-B*log(1+S/B)))
-
-def Z(S, B):
-  if B<=0:
-    return -100
-  return S/sqrt(S+B)
-
-def Significance(df_s,df_b, score_column = 'BDTscore', func=Z0, score_range=(0, 1), nbins=50):
-  S0 = np.sum(df_s.loc[df_s.index,'norm_weight'])
-  B0 = np.sum(df_b.loc[df_b.index,'norm_weight']) 
-  print('initial: S0={:.2f}, B0={:.2f}'.format(S0, B0))
-  print('inclusive Z: {:.2f}'.format(func(S0, B0)))
-
-  wid = (score_range[1]-score_range[0])/nbins
-  arr_x = np.round(np.array([score_range[0]+i*wid for i in range(nbins)]), decimals=2)
-  arr_Z=np.zeros([nbins])
-
-  for i in tqdm(range(nbins)):
-    xi = score_range[0]+i*wid
-    Si = np.sum(df_s.loc[df_s.query(f'{score_column} >= {str(xi)}').index,'norm_weight'])
-    Bi = np.sum(df_b.loc[df_b.query(f'{score_column} >= {str(xi)}').index,'norm_weight'])
-    Zi = func(Si, Bi)
-    if Bi<0: continue
-    if Zi<0: continue
-    arr_Z[i]=Zi
-          
-  df_Z = pd.DataFrame(data=arr_Z, index=arr_x, columns=["Z"])
-  
-  return df_Z
-
-def thres_opt(df, score_column = 'BDTscore', func=Z0, n_spliter=2, score_range=(0, 1), nbins=50, precut='test==True',b_scale=1.):
-  df_s = df.query(precut+' & isSignal==1')
-  df_b = df.query(precut+' & isSignal==0')
-  S0 = len(df_s.index)
-  B0 = b_scale*len(df_b.index)
-  print('initial: S0={:.2f}, B0={:.2f}'.format(S0, B0))
-  print('inclusive Z: {:.2f}'.format(func(S0, B0)))
-
-  wid = (score_range[1]-score_range[0])/nbins
-  arr_x = np.round(np.array([score_range[0]+i*wid for i in range(nbins)]), decimals=2)
-  arr_Ztot=np.zeros([nbins, nbins])
-
-  for i in tqdm(range(nbins)):
-    xi = score_range[0]+i*wid
-    Si = len(df_s.query(f'{score_column} >= {str(xi)}').index)
-    Bi = b_scale*len(df_b.query(f'{score_column} >= {str(xi)}').index)
-    Zi = func(Si, Bi)
-    if Bi<=11: continue
-    if Zi<0: continue
-
-    for j in range(i):
-      xj = score_range[0]+j*wid
-      Sj = len(df_s.query(f'{BDTscore} >= {str(xj)} & {BDTscore} < {str(xi)}').index)
-      Bj = b_scale*len(df_b.query(f'{BDTscore} >= {str(xj)} & {BDTscore} < {str(xi)}').index)
-      Zj = func(Sj, Bj)
-      if Bj<=11: continue
-      if Zj<0: continue
-      Ztot = sqrt(Zi**2+Zj**2)
-      arr_Ztot[i][j] = Ztot
-
-  df_Z = pd.DataFrame(data=arr_Ztot, index=arr_x, columns=arr_x)
-
-  return df_Z
-
-def plot_roc_curve(df, score_column, tpr_threshold=0.7, ax=None, color=None, linestyle='-', label=None):
-    if ax is None:
-        ax = plt.gca()
-    if label is None:
-        label = score_column
-    fpr, tpr, thresholds = metrics.roc_curve(df['isSignal'], df[score_column] )
-    roc_auc = auc(fpr, tpr)
-    mask = tpr >= tpr_threshold
-    fpr, tpr = fpr[mask], tpr[mask]
-    ax.plot(fpr, tpr, label=label+', auc={:.2f}'.format(roc_auc), color=color, linestyle=linestyle)
-    #ax.semilogy(tpr, fpr, label=label, color=color, linestyle=linestyle)
-#__________________________________________________________
-def dir_exist(mydir):
-    import os.path
-    if os.path.exists(mydir): return True
-    else: return False
+import os
+import pathlib
+import shutil
+import logging
+import string
+import random
+import json
+import ROOT  # type: ignore
 
 
-#__________________________________________________________
-def create_dir(mydir):
-    if not dir_exist(mydir):
-        import os
-        os.system('mkdir -p {}'.format(mydir))
+ROOT.gROOT.SetBatch(True)
 
-#__________________________________________________________
-def replace_placeholders(config, final_state, ecm):
-    for attr in dir(config.loc):
-        if not attr.startswith("__"):
-            value = getattr(config.loc, attr)
-            if isinstance(value, str):
-                value = value.replace("{final_state}", final_state).replace("{ecm}", ecm)
-                setattr(config.loc, attr, value)
+LOGGER: logging.Logger = logging.getLogger('FCCAnalyses.utils')
 
-    config.mode_names = {k.replace("{final_state}", final_state).replace("{ecm}", ecm): v.replace("{final_state}", final_state).replace("{ecm}", ecm) for k, v in config.mode_names.items()}
-    return config
+
+# _____________________________________________________________________________
+def generate_graph(dframe,
+                   output_path: str,
+                   suffix: str | None = None) -> None:
+    '''
+    Generate computational graph of the analysis
+    '''
+    # Check if output file path is provided
+    graph_path: pathlib.PurePath = pathlib.PurePath(output_path)
+
+    # check if file path ends with "correct" extension
+    if graph_path.suffix not in ('.dot', '.png'):
+        LOGGER.warning('Graph output file extension not recognized!\n'
+                       'Using analysis script name...')
+        graph_path = pathlib.PurePath(os.getcwd(), 'fccanalysis_graph.dot')
+
+    # Add optional suffix to the output file path
+    if suffix is not None:
+        graph_path = graph_path.with_name(graph_path.stem +
+                                          suffix +
+                                          graph_path.suffix)  # extension
+
+    # Announce to which files graph will be saved
+    if shutil.which('dot') is None:
+        LOGGER.info('Analysis computational graph will be saved into:\n - %s',
+                    graph_path.with_suffix('.dot'))
+    else:
+        LOGGER.info('Analysis computational graph will be saved '
+                    'into:\n - %s\n - %s',
+                    graph_path.with_suffix('.dot'),
+                    graph_path.with_suffix('.png'))
+
+    # Generate graph in .dot format
+    ROOT.RDF.SaveGraph(dframe, str(graph_path.with_suffix('.dot')))
+
+    if shutil.which('dot') is None:
+        LOGGER.warning('PNG version of the computational graph will not be '
+                       'generated.\nGraphviz library not found!')
+        return
+
+    # Convert .dot file into .png
+    os.system(f'dot -Tpng {graph_path.with_suffix(".dot")} '
+              f'-o {graph_path.with_suffix(".png")}')
+
+
+# _____________________________________________________________________________
+def save_benchmark(outfile, benchmark):
+    '''
+    Save benchmark results to a JSON file.
+    '''
+    benchmarks = []
+    try:
+        with open(outfile, 'r', encoding='utf-8') as benchin:
+            benchmarks = json.load(benchin)
+    except OSError:
+        pass
+    except json.decoder.JSONDecodeError:
+        pass
+
+    benchmarks = [b for b in benchmarks if b['name'] != benchmark['name']]
+    benchmarks.append(benchmark)
+
+    with open(outfile, 'w', encoding='utf-8') as benchout:
+        json.dump(benchmarks, benchout, indent=2)
+
+
+# _____________________________________________________________________________
+def random_string(length: int = 8):
+    '''
+    Generate random string of specified length.
+    '''
+    return ''.join(random.choices(string.ascii_letters + string.digits,
+                                  k=length))

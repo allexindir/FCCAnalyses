@@ -31,14 +31,15 @@ endmacro()
 
 function(add_integration_test _testname)
   #FIXME make this call 'add_generic_test'
+  string(RANDOM _random)
   add_test(NAME fccanalysisrun_${_testname}
           # todo: figure out how to make ctest pick fccanalysis up from PATH
-          COMMAND ${CMAKE_SOURCE_DIR}/bin/fccanalysis run ${_testname} --test --nevents 100 --bench
+          COMMAND ${CMAKE_SOURCE_DIR}/bin/fccanalysis run ${_testname} --test --nevents 100 --bench -o ${CMAKE_BINARY_DIR}/output-${_random}.root
           WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
           )
   set_property(TEST fccanalysisrun_${_testname} APPEND PROPERTY ENVIRONMENT
     LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/analyzers/dataframe:$ENV{LD_LIBRARY_PATH}
-    PYTHONPATH=${CMAKE_SOURCE_DIR}/python:${CMAKE_BINARY_DIR}:$ENV{PYTHONPATH}
+    PYTHONPATH=${CMAKE_SOURCE_DIR}/python:${INSTALL_SHARE_DIR}/examples:${CMAKE_BINARY_DIR}:$ENV{PYTHONPATH}
     PATH=${CMAKE_SOURCE_DIR}/bin:${CMAKE_BINARY_DIR}:$ENV{PATH}
     ROOT_INCLUDE_PATH=${CMAKE_SOURCE_DIR}/analyzers/dataframe:$ENV{ROOT_INCLUDE_PATH}
     TEST_INPUT_DATA_DIR=${TEST_INPUT_DATA_DIR}
@@ -51,16 +52,17 @@ function(add_generic_test _testname _testcmd)
            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   set_property(TEST ${_testname}
                APPEND PROPERTY ENVIRONMENT
-               LD_LIBRARY_PATH=${INSTALL_LIB_DIR}:${CMAKE_BINARY_DIR}/analyzers/dataframe:${CMAKE_BINARY_DIR}/case-studies:$ENV{LD_LIBRARY_PATH}
+               LD_LIBRARY_PATH=${INSTALL_LIB_DIR}:${CMAKE_BINARY_DIR}/analyzers/dataframe:$ENV{LD_LIBRARY_PATH}
                PYTHONPATH=${CMAKE_SOURCE_DIR}/python:$ENV{PYTHONPATH}
                PATH=${CMAKE_SOURCE_DIR}/bin:${CMAKE_BINARY_DIR}:$ENV{PATH}
-               ROOT_INCLUDE_PATH=${INSTALL_LIB_DIR}:${CMAKE_SOURCE_DIR}/analyzers/dataframe:${CMAKE_BINARY_DIR}/case-studies:$ENV{ROOT_INCLUDE_PATH}
+               ROOT_INCLUDE_PATH=${INSTALL_LIB_DIR}:${CMAKE_SOURCE_DIR}/analyzers/dataframe:$ENV{ROOT_INCLUDE_PATH}
                TEST_INPUT_DATA_DIR=${TEST_INPUT_DATA_DIR})
 endfunction()
 
 function(add_standalone_test _testname)
+  string(RANDOM _random)
   add_test(NAME fccanalysis_standalone_${_testname}
-           COMMAND python ${_testname} --test
+           COMMAND python ${_testname} --test -o ${CMAKE_BINARY_DIR}/output-${_random}.root
            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
   )
   set_property(TEST fccanalysis_standalone_${_testname} APPEND PROPERTY ENVIRONMENT
@@ -87,7 +89,7 @@ macro(fccanalyses_addon_build _name)
     target_include_directories(${_name} PUBLIC $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/addons>
                                                $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/analyzers/dataframe>)
     if(ARG_EXT_LIBS)
-      target_link_libraries(${_name} ${ARG_EXT_LIBS})
+      target_link_libraries(${_name} PUBLIC ${ARG_EXT_LIBS})
     endif()
     if(ARG_EXT_HEADERS)
       target_include_directories(${_name} PUBLIC ${ARG_EXT_HEADERS})
@@ -106,15 +108,4 @@ macro(fccanalyses_addon_build _name)
             PUBLIC_HEADER DESTINATION "${INSTALL_INCLUDE_DIR}/${_name}"
             COMPONENT ${ARG_INSTALL_COMPONENT})
   endif()
-endmacro()
-
-macro(get_subdirectories result dir)
-  file(GLOB sub_dirs RELATIVE ${dir} ${dir}/*)
-  set(dirs)
-  foreach(_dir ${sub_dirs})
-    if(IS_DIRECTORY ${dir}/${_dir})
-      list(APPEND dirs ${_dir})
-    endif()
-  endforeach()
-  set(${result} ${dirs})
 endmacro()

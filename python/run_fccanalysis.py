@@ -4,802 +4,675 @@ Run analysis of style "Analysis", which can be split into several stages.
 
 import os
 import sys
-import time
-import shutil
-import json
-import logging
-import subprocess
+import string
 import datetime
-import numpy as np
+import logging
+import argparse
+from typing import Any, Optional, Union
 
 import ROOT  # type: ignore
-from anascript import get_element, get_element_dict, get_attribute
-from process import get_process_info, get_entries_sow
-from frame import generate_graph
+from anascript import validate_analysis_class, validate_sample_list
+from sample import get_file_list, get_subfile_list, get_chunk_list
+from sample import get_files_in_dir, get_files_in_yaml
+from sample import get_file_quantities
+from sample import apply_filepath_rewrites
+from utils import save_benchmark
+from job import Job
 
-LOGGER = logging.getLogger('FCCAnalyses.run')
 
 ROOT.gROOT.SetBatch(True)
 
-
-# _____________________________________________________________________________
-def determine_os(local_dir: str) -> str | None:
-    '''
-    Determines platform on which FCCAnalyses was compiled
-    '''
-    cmake_config_path = local_dir + '/build/CMakeFiles/CMakeConfigureLog.yaml'
-    if not os.path.isfile(cmake_config_path):
-        LOGGER.warning('CMake configuration file was not found!\n'
-                       'Was FCCAnalyses properly build?')
-        return None
-
-    with open(cmake_config_path, 'r', encoding='utf-8') as cmake_config_file:
-        cmake_config = cmake_config_file.read()
-        if 'centos7' in cmake_config:
-            return 'centos7'
-        if 'almalinux9' in cmake_config:
-            return 'almalinux9'
-
-    return None
+LOGGER = logging.getLogger('FCCAnalyses.run_analysis')
 
 
 # _____________________________________________________________________________
-def create_condor_config(log_dir: str,
-                         process_name: str,
-                         build_os: str | None,
-                         rdf_module,
-                         subjob_scripts: list[str]) -> str:
+def generate_sample_jobs(config: dict[str, Any]) -> \
+        list[dict[str, Union[int, float, str]]]:
     '''
-    Creates contents of condor configuration file.
+    Generate the jobs to run from samples defined in the analysis class.
     '''
-    cfg = 'executable       = $(filename)\n'
+    jobs: list[dict[str, Union[int, float, str]]] = []
 
-    cfg += f'Log              = {log_dir}/condor_job.{process_name}.'
-    cfg += '$(ClusterId).$(ProcId).log\n'
+    for sample_name, sample_dict in config['samples'].items():
+        LOGGER.info('Initializing sample "%s" ...', sample_name)
+        info_msg = 'The sample will be processed with the following ' \
+                   'parameters:'
 
-    cfg += f'Output           = {log_dir}/condor_job.{process_name}.'
-    cfg += '$(ClusterId).$(ProcId).out\n'
+        sample_file_list: Optional[list[str]] = None
+        file_quantities: Optional[list[dict[str,
+                                            Union[int, float, str]]]] = None
 
-    cfg += f'Error            = {log_dir}/condor_job.{process_name}.'
-    cfg += '$(ClusterId).$(ProcId).error\n'
+        # Check if input directory is provided
+        if 'input-dir' in sample_dict:
+            if isinstance(sample_dict['input-dir'], str):
+                LOGGER.info('Will inspect the sample input directory for the '
+                            'sample information.')
+                sample_file_list = get_files_in_dir(sample_dict['input-dir'])
 
-    cfg += 'getenv           = False\n'
+        # Check if file list is provided
+        if 'input-file-list' in sample_dict:
+            if isinstance(sample_dict['input-file-list'], str):
+                LOGGER.info('Will inspect the sample input file list for the '
+                            'sample information.')
+                sample_file_list = \
+                    get_file_list(sample_dict['input-file-list'])
 
-    cfg += 'environment      = "LS_SUBCWD={log_dir}"\n'  # not sure
+        # Check if files are provided
+        if 'input-files' in sample_dict:
+            if isinstance(sample_dict['input-files'], list):
+                if all(isinstance(x, str) for x in sample_dict['input-files']):
+                    LOGGER.info('Will inspect directly provided input files '
+                                'for the sample information.')
+                    sample_file_list = sample_dict['input-files']
 
-    cfg += 'requirements     = ( '
-    if build_os == 'centos7':
-        cfg += '(OpSysAndVer =?= "CentOS7") && '
-    if build_os == 'almalinux9':
-        cfg += '(OpSysAndVer =?= "AlmaLinux9") && '
-    if build_os is None:
-        LOGGER.warning('Submitting jobs to default operating system. There '
-                       'may be compatibility issues.')
-    cfg += '(Machine =!= LastRemoteHost) && (TARGET.has_avx2 =?= True) )\n'
+        # Using globally set input directory or campaign / production tag
+        if sample_file_list is None:
+            if config['input-dir'] is not None:
+                LOGGER.info('Will inspect the global input directory for the '
+                            'sample information.')
+                sample_file_list = get_files_in_dir(
+                    os.path.join(config['input-dir'], sample_name)
+                )
+            elif config['campaign'] is not None:
+                LOGGER.info('Found the sample information in the campaign: %s',
+                            config['campaign'])
+                sample_file_list, file_quantities = get_files_in_yaml(
+                    sample_name,
+                    config['campaign']
+                )
+            else:
+                sample_file_list = None
 
-    cfg += 'on_exit_remove   = (ExitBySignal == False) && (ExitCode == 0)\n'
+        if sample_file_list is None:
+            LOGGER.error('Could not determine the input file list for the '
+                         'sample "%s"!\nAborting...', sample_name)
+            sys.exit(3)
 
-    cfg += 'max_retries      = 3\n'
+        if not sample_file_list:
+            LOGGER.warning('The input file list for the sample "%s" is '
+                           'empty!\nAborting...', sample_name)
+            sys.exit(3)
 
-    cfg += '+JobFlavour      = "%s"\n' % get_element(rdf_module, 'batchQueue')
+        info_msg += '\n - total number of files in the sample:  ' \
+                    f'{len(sample_file_list):,}'
 
-    cfg += '+AccountingGroup = "%s"\n' % get_element(rdf_module, 'compGroup')
+        # Apply file-path rewrites
+        if config['apply-filepath-rewrites']:
+            sample_file_list = [apply_filepath_rewrites(fpath) for fpath in
+                                sample_file_list]
+            if file_quantities is not None:
+                file_quantities = [
+                    fqs | {'path': apply_filepath_rewrites(fqs['path'])}
+                    for fqs in file_quantities
+                ]
 
-    cfg += 'RequestCpus      = %i\n' % get_element(rdf_module, "nCPUS")
+        # Reduce the sample by a required fraction
+        if 'fraction' in sample_dict:
+            fraction = 1.
+            if isinstance(sample_dict['fraction'], float):
+                fraction = sample_dict['fraction']
+            else:
+                LOGGER.error('Provided sample reduction fraction is not a '
+                             'float!\nAborting...')
+                sys.exit(3)
 
-    cfg += 'queue filename matching files'
-    for script in subjob_scripts:
-        cfg += ' ' + script
-    cfg += '\n'
+            if fraction < 1.:
+                if file_quantities is None:
+                    file_quantities = get_file_quantities(sample_file_list)
+                if not file_quantities:
+                    LOGGER.error('Can\'t determine the number of events for '
+                                 'the provided input files!\nAborting...')
+                    sys.exit(3)
+                if len(file_quantities) != len(sample_file_list):
+                    LOGGER.warning('For some files the number of events '
+                                   'could not be determined!\nThey will be '
+                                   'ignored...')
+                # print(file_quantities)
 
-    return cfg
+                # TODO: Rewrite get_subfile_list() function
+                sample_file_list = get_subfile_list(
+                    [fqs['path'] for fqs in file_quantities],
+                    [fqs['events-in-ttree'] for fqs in file_quantities],
+                    fraction
+                )
+                info_msg += '\n - sample reduction fraction:  ' \
+                            f'          {fraction:0,.4g}'
+                info_msg += '\n - number of files after reduction:  ' \
+                            f'    {len(sample_file_list):,}'
+
+        # Output directory
+        output_stem = sample_name
+        if 'output' in sample_dict:
+            LOGGER.warning('[DEPRECIATED] please use \'output-stem\' instead '
+                           'of \'output\' to specify different sample output '
+                           'directory.')
+            output_stem = sample_dict['output']
+            info_msg += '\n - custom output stem set to:  ' \
+                        f'          {output_stem}'
+        if 'output-stem' in sample_dict:
+            output_stem = sample_dict['output-stem']
+            info_msg += '\n - custom output stem set to:  ' \
+                        f'          {output_stem}'
+
+        # Split into chunks
+        n_chunks = 1
+        if 'chunks' in sample_dict:
+            if isinstance(sample_dict['chunks'], int):
+                n_chunks = sample_dict['chunks']
+            else:
+                LOGGER.error('Provided number of output chunks is not an '
+                             'integer!\nAborting...')
+                sys.exit(3)
+
+        if n_chunks > len(sample_file_list):
+            LOGGER.warning('Can\'t split input sample of %i files into '
+                           '%i output chunks!\nAdjusting the number of output '
+                           'chunks...',
+                           len(sample_file_list), n_chunks)
+
+            n_chunks = len(sample_file_list)
+
+        chunks_list = get_chunk_list(sample_file_list, n_chunks)
+
+        info_msg += '\n - number of output chunks:  ' \
+                    f'            {len(chunks_list):,}'
+
+        # Maximum number of events
+        n_events_max = None
+        if sample_dict['n-events-max'] is not None:
+            if n_chunks > 1:
+                LOGGER.warning('Specifying maximum number of events is '
+                               'not supported in case of multiple output '
+                               'chunks.\nIgnoring the setting...')
+            else:
+                n_events_max = sample_dict['n-events-max']
+                info_msg += '\n - Maximum number of events:  ' \
+                            f'           {n_events_max}'
+
+        # Stride through the sample
+        stride = sample_dict['stride']
+        if stride is not None:
+            info_msg += '\n - Number of events to stride:  ' \
+                        f'         {stride}'
+
+        LOGGER.info(info_msg)
+
+        for idx, chunk_list in enumerate(chunks_list):
+            job = {}
+
+            job['name'] = sample_name + f'-{idx}'
+            job['input-file-list'] = chunk_list
+            job['output-file'] = os.path.join(
+                config['output-dir'],
+                output_stem,
+                output_stem + f'-chunk-{idx}.root'
+            )
+            job['n-events-max'] = n_events_max
+            job['stride'] = stride
+
+            jobs.append(job)
+    return jobs
 
 
 # _____________________________________________________________________________
-def create_subjob_script(local_dir: str,
-                         analysis,
-                         process_name: str,
-                         chunk_num: int,
-                         chunk_list: list[list[str]],
-                         anapath: str,
-                         cmd_args) -> str:
+def generate_jobs(config: dict[str, Any]) -> list[dict[str, Any]]:
     '''
-    Creates sub-job script to be run.
+    Generate the jobs to run.
     '''
 
-    output_dir = get_attribute(analysis, 'output_dir', None)
+    # Test job
+    if config['test-file'] is not None:
+        LOGGER.info('Generating test job...')
 
-    scr = '#!/bin/bash\n\n'
-    scr += 'source ' + local_dir + '/setup.sh\n\n'
+        if config['samples'] is not None:
+            LOGGER.warning('Samples/processes defined in your analysis script '
+                           'will be ignored...')
 
-    # add user batch configuration if any
-    user_batch_config = get_attribute(analysis, 'user_batch_config', None)
-    if user_batch_config is not None:
-        if not os.path.isfile(user_batch_config):
-            LOGGER.warning('userBatchConfig file can\'t be found! Will not '
-                           'add it to the default config.')
+        job: dict[str, Any] = {}
+        job['name'] = 'test'
+        job['input-file-list'] = [config['test-file']]
+        job['output-file'] = 'test-output.root'
+        if config['output-file'] is not None:
+            job['output-file'] = config['output-file']
+        job['n-events-max'] = config['n-events-max']
+        job['stride'] = config['stride']
+
+        return [job]
+
+    # Independent sample
+    if config['input-file-list'] is not None:
+        LOGGER.info('Generating jobs for independent sample...')
+
+        if config['samples'] is not None:
+            LOGGER.warning('Samples/processes defined in your analysis script '
+                           'will be ignored...')
+
+        # Apply file-path rewrites
+        if config['apply-filepath-rewrites']:
+            input_file_list = [apply_filepath_rewrites(fpath) for fpath in
+                               config['input-file-list']]
         else:
-            with open(user_batch_config, 'r', encoding='utf-8') as cfgfile:
-                for line in cfgfile:
-                    scr += line + '\n'
-        scr += '\n\n'
+            input_file_list = config['input-file-list']
 
-    scr += f'mkdir job_{process_name}_chunk_{chunk_num}\n'
-    scr += f'cd job_{process_name}_chunk_{chunk_num}\n\n'
+        # Only one output chunk
+        if config['n-chunks'] is None:
+            job = {}
+            if config['sample-name'] is not None:
+                sample_name = config['sample-name']
+            else:
+                sample_name = 'independent-sample'
 
-    if not os.path.isabs(output_dir):
-        output_path = os.path.join(output_dir, f'chunk_{chunk_num}.root')
-    else:
-        output_path = os.path.join(output_dir, process_name,
-                                   f'chunk_{chunk_num}.root')
+            job['name'] = sample_name
+            job['input-file-list'] = input_file_list
+            if config['output-file'] is not None:
+                job['output-file'] = config['output-file']
+            else:
+                job['output-file'] = os.path.join(
+                    config['output-dir'],
+                    sample_name,
+                    sample_name + '.root'
+                )
+            job['n-events-max'] = config['n-events-max']
+            job['stride'] = config['stride']
 
-    scr += local_dir
-    scr += f'/bin/fccanalysis run {anapath} --batch'
-    scr += f' --output {output_path}'
-    if cmd_args.ncpus > 0:
-        scr += f' --ncpus {cmd_args.ncpus}'
-    if len(cmd_args.unknown) > 0:
-        scr += ' ' + ' '.join(cmd_args.unknown)
-    scr += ' --files-list'
-    for file_path in chunk_list[chunk_num]:
-        scr += f' {file_path}'
-    scr += '\n\n'
+            return [job]
 
-    output_dir_eos = get_attribute(analysis, 'output_dir_eos', None)
-    if not os.path.isabs(output_dir) and output_dir_eos is None:
-        final_dest = os.path.join(local_dir, output_dir, process_name,
-                                  f'chunk_{chunk_num}.root')
-        scr += f'cp {output_path} {final_dest}\n'
+        # Multiple output chunks
+        n_chunks = config['n-chunks']
 
-    if output_dir_eos is not None:
-        eos_type = get_attribute(analysis, 'eos_type', 'eospublic')
+        if n_chunks > len(input_file_list):
+            LOGGER.error('Can\'t split input sample of %i files into '
+                         '%i output chunks!\nAborting...',
+                         len(input_file_list), n_chunks)
+            sys.exit(3)
 
-        final_dest = os.path.join(output_dir_eos,
-                                  process_name,
-                                  f'chunk_{chunk_num}.root')
-        final_dest = f'root://{eos_type}.cern.ch/' + final_dest
-        scr += f'xrdcp {output_path} {final_dest}\n'
+        chunk_list = get_chunk_list(input_file_list, n_chunks)
 
-    return scr
+        if config['output-file'] is not None:
+            LOGGER.warning('When processing an independent sample in '
+                           'multiple chunks direct output path is '
+                           'ignored!\nOutput path is created from the '
+                           'output directory and the sample name '
+                           'instead!')
+        if config['n-events-max'] is not None:
+            LOGGER.warning('Specifying maximum number of events is not '
+                           'supported in case of multiple output chunks.'
+                           '\nIgnoring the setting...')
 
+        jobs = []
+        for idx, chunk in enumerate(chunk_list):
+            job = {}
+            if config['sample-name'] is not None:
+                sample_name = config['sample-name']
+            else:
+                sample_name = 'independent-sample'
 
-# _____________________________________________________________________________
-def get_subfile_list(in_file_list: list[str],
-                     event_list: list[int],
-                     fraction: float) -> list[str]:
-    '''
-    Obtain list of files roughly containing the requested fraction of events.
-    '''
-    nevts_total: int = sum(event_list)
-    nevts_target: int = int(nevts_total * fraction)
+            job['name'] = sample_name + f'-{idx}'
+            job['input-file-list'] = chunk
+            job['output-file'] = os.path.join(
+                config['output-dir'],
+                sample_name,
+                sample_name + f'-chunk-{idx}.root'
+            )
+            job['n-events-max'] = None
+            job['stride'] = config['stride']
 
-    if nevts_target <= 0:
-        LOGGER.error('The reduction fraction %f too stringent, no events '
-                     'left!\nAborting...', fraction)
+            jobs.append(job)
+
+        return jobs
+
+    # Samples defined in samples (process) list
+    if config['samples'] is None:
+        LOGGER.info('Could not find sample definitions to run!\nAborting...')
         sys.exit(3)
 
-    nevts_real: int = 0
-    out_file_list: list[str] = []
-    for i, nevts in enumerate(event_list):
-        if nevts_real >= nevts_target:
-            break
-        nevts_real += nevts
-        out_file_list.append(in_file_list[i])
+    if len(config['samples']) == 1:
+        LOGGER.info('Found one sample defined in the analysis.')
+    else:
+        LOGGER.info('Found %i samples defined in the analysis.',
+                    len(config['samples']))
 
-    info_msg = f'Reducing the input file list by fraction "{fraction}" of '
-    info_msg += 'total events:\n\t'
-    info_msg += f'- total number of events: {nevts_total:,}\n\t'
-    info_msg += f'- targeted number of events: {nevts_target:,}\n\t'
-    info_msg += '- number of events in the resulting file list: '
-    info_msg += f'{nevts_real:,}\n\t'
-    info_msg += '- number of files after reduction: '
-    info_msg += str((len(out_file_list)))
-    LOGGER.info(info_msg)
-
-    return out_file_list
+    return generate_sample_jobs(config)
 
 
 # _____________________________________________________________________________
-def get_chunk_list(file_list: str, chunks: int):
+def merge_config(args: argparse.Namespace,
+                 analysis_class: Any) -> dict[str, Any]:
     '''
-    Get list of input file paths arranged into chunks.
+    Merge configuration from command line arguments, analysis class and
+    environment variables.
     '''
-    chunk_list = list(np.array_split(file_list, chunks))
-    return [chunk for chunk in chunk_list if chunk.size > 0]
+    config: dict[str, Any] = {}
 
+    # Deprecations
+    if args.files_list is not None:
+        LOGGER.error('--files-list CLI argument is no longer supported, use '
+                     '--i/--input instead!\nAborting...')
+        sys.exit(3)
+    if hasattr(analysis_class, 'process_list'):
+        LOGGER.warning('[DEPRECATED] Please use "samples" instead of '
+                       '"process_list"!')
 
-# _____________________________________________________________________________
-def save_benchmark(outfile, benchmark):
-    '''
-    Save benchmark results to a JSON file.
-    '''
-    benchmarks = []
-    try:
-        with open(outfile, 'r', encoding='utf-8') as benchin:
-            benchmarks = json.load(benchin)
-    except OSError:
-        pass
+    if hasattr(analysis_class, 'prod_tag'):
+        LOGGER.warning('[DEPRECATED] Please use "campaign" instead of '
+                       '"prod_tag"!')
 
-    benchmarks = [b for b in benchmarks if b['name'] != benchmark['name']]
-    benchmarks.append(benchmark)
+    # Determining Key4hep stack and OS
+    if 'KEY4HEP_STACK' not in os.environ:
+        LOGGER.error('Key4hep stack not setup!\nAborting...')
+        sys.exit(3)
+    k4h_stack_env = os.environ['KEY4HEP_STACK']
+    if 'sw-nightlies.hsf.org' in k4h_stack_env:
+        config['key4hep-stack'] = 'nightlies'
+    elif 'sw.hsf.org' in k4h_stack_env:
+        config['key4hep-stack'] = 'release'
+    else:
+        LOGGER.error('Key4hep stack not recognized!\nAborting...')
+        sys.exit(3)
 
-    with open(outfile, 'w', encoding='utf-8') as benchout:
-        json.dump(benchmarks, benchout, indent=2)
+    if 'almalinux9' in k4h_stack_env:
+        config['key4hep-os'] = 'alma9'
+    elif 'almalinux10' in k4h_stack_env:
+        config['key4hep-os'] = 'alma10'
+    elif 'ubuntu22' in k4h_stack_env:
+        config['key4hep-os'] = 'ubuntu22'
+    elif 'ubuntu24' in k4h_stack_env:
+        config['key4hep-os'] = 'ubuntu24'
+    else:
+        LOGGER.error('Key4hep OS not recognized!\nAborting...')
+        sys.exit(3)
 
+    # Determine analysis script path
+    config['anascript-path'] = os.path.abspath(args.anascript_path)
 
-# _____________________________________________________________________________
-def submit_job(cmd: str, max_trials: int) -> bool:
-    '''
-    Submit job to condor, retry `max_trials` times.
-    '''
-    for i in range(max_trials):
-        with subprocess.Popen(cmd, shell=True,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              universal_newlines=True) as proc:
-            (stdout, stderr) = proc.communicate()
+    # Determine analysis directory
+    config['analysis-dir'] = os.path.dirname(
+        os.path.abspath(args.anascript_path)
+    )
 
-            if proc.returncode == 0 and len(stderr) == 0:
-                LOGGER.info(stdout)
-                LOGGER.info('GOOD SUBMISSION')
-                return True
+    # Input file list
+    config['input-file-list'] = None
+    if args.input_file_list is not None:
+        config['input-file-list'] = get_file_list(args.input_file_list)
+    if args.input is not None:
+        config['input-file-list'] = args.input
 
-            LOGGER.warning('Error while submitting, retrying...\n  '
-                           'Trial: %i / %i\n  Error: %s',
-                           i, max_trials, stderr)
-            time.sleep(10)
+    # Check for sample name
+    config['sample-name'] = None
+    if args.sample_name is not None:
+        config['sample-name'] = args.sample_name
 
-    LOGGER.error('Failed submitting after: %i trials!', max_trials)
-    return False
+    # Check for sample list
+    config['samples'] = None
+    if hasattr(analysis_class, 'process_list'):
+        config['samples'] = validate_sample_list(analysis_class.process_list)
+    if hasattr(analysis_class, 'samples'):
+        config['samples'] = validate_sample_list(analysis_class.samples)
 
+    if config['samples'] == {}:
+        LOGGER.warning('Provided samples dictionary contains no elements!')
+        config['samples'] = None
 
-# _____________________________________________________________________________
-def merge_config(args: object, analysis: object) -> dict[str, any]:
-    '''
-    Merge configuration from command line arguments and analysis class.
-    '''
-    config: dict[str, any] = {}
+    # Check for campaign / production tag
+    config['campaign'] = None
+    if hasattr(analysis_class, 'campaign'):
+        config['campaign'] = analysis_class.campaign
+    if hasattr(analysis_class, 'prod_tag'):
+        config['campaign'] = analysis_class.prod_tag
+
+    # Check for input directory
+    config['input-dir'] = None
+    if hasattr(analysis_class, 'input_dir'):
+        config['input-dir'] = analysis_class.input_dir
+
+    # Check whether a test is run
+    config['test-file'] = None
+    if args.test is not None:
+        if hasattr(analysis_class, 'test_file'):
+            config['test-file'] = analysis_class.test_file
+        if args.test_file is not None:
+            config['test-file'] = args.test_file
+
+        if config['test-file'] is None:
+            LOGGER.error('Could not find a test file!\nAborting...')
+            sys.exit(3)
+
+    # Check include header files
+    config['include-paths'] = None
+    if hasattr(analysis_class, 'include_paths'):
+        config['include-paths'] = analysis_class.include_paths
+
+    # Check for analysis name
+    config['analysis-name'] = None
+    if hasattr(analysis_class, 'analysis_name'):
+        config['analysis-name'] = analysis_class.analysis_name
+    if args.analysis_name is not None:
+        config['analysis-name'] = args.analysis_name
+
+    # Check for output file
+    config['output-file'] = None
+    if hasattr(analysis_class, 'output_file'):
+        config['output-file'] = analysis_class.output_file
+    if args.output is not None:
+        config['output-file'] = args.output
+
+    # Check for output directory
+    config['output-dir'] = None
+    if hasattr(analysis_class, 'output_dir'):
+        config['output-dir'] = analysis_class.output_dir
+    if args.output_dir is not None:
+        config['output-dir'] = args.output_dir
+
+    # Check for number of output chunks
+    config['n-chunks'] = None
+    if args.n_chunks is not None:
+        config['n-chunks'] = args.n_chunks
+
+    # Check number of events to be run over
+    config['n-events-max'] = None
+    if args.nevents is not None:
+        config['n-events-max'] = args.nevents
+
+    # Check if stride through the sample
+    config['stride'] = None
+    if args.stride is not None:
+        config['stride'] = args.stride
+
+    # Check number of requested threads
+    config['n-threads'] = 1
+    if hasattr(analysis_class, "n_threads"):
+        config['n-threads'] = analysis_class.n_threads
+    if args.ncpus is not None:
+        config['n-threads'] = args.ncpus
 
     # Check whether to use PODIO DataSource to load the events
-    config['use_data_source'] = False
+    config['use-data-source'] = False
+    if hasattr(analysis_class, 'use_data_source'):
+        config['use-data-source'] = True
     if args.use_data_source:
-        config['use_data_source'] = True
-    if get_attribute(analysis, 'use_data_source', False):
-        config['use_data_source'] = True
-    # Check whether to use event weights (only supported as analysis config file option, not command line!)
-    config['do_weighted'] = False
-    if get_attribute(analysis, 'do_weighted', False):
-        config['do_weighted'] = True
+        config['use-data-source'] = True
+
+    # Check if the progress-bar is enabled
+    config['enable-progress-bar'] = True
+    if args.progress_bar is not None:
+        config['enable-progress-bar'] = args.progress_bar
+
+    # Check whether to create the computational graph
+    config['generate-graph'] = False
+    config['graph-path'] = None
+    if args.graph is not None:
+        config['generate-graph'] = args.graph
+
+        if config['generate-graph']:
+            config['graph-path'] = args.graph_path
+            if config['graph-path'] is None:
+                config['graph_path'] = os.path.join(os.getcwd(),
+                                                    'fccanalysis_graph.dot')
+
+    # Load geometry, needed for the CaloNtupleizer analyzers
+    config['geometry-path'] = None
+    if hasattr(analysis_class, 'geometry_path'):
+        config['geometry-path'] = analysis_class.geometry_path
+
+    config['readout-name'] = None
+    if hasattr(analysis_class, 'readout_name'):
+        config['readout-name'] = analysis_class.readout_name
+
+    # Check whether to apply file-path rewrites
+    config['apply-filepath-rewrites'] = True
+    if args.apply_filepath_rewrites is not None:
+        config['apply-filepath-rewrites'] = args.apply_filepath_rewrites
+
+    # Check whether to save benchmark results
+    config['bench'] = False
+    if args.bench is not None:
+        config['bench'] = args.bench
 
     return config
 
 
 # _____________________________________________________________________________
-def initialize(config, args, analysis):
+def global_setup(config):
     '''
-    Common initialization steps.
+    Initialization steps.
     '''
 
     # For convenience and compatibility with user code
-    if config['use_data_source']:
+    if config['use-data-source']:
         ROOT.gInterpreter.Declare("using namespace FCCAnalyses::PodioSource;")
     else:
         ROOT.gInterpreter.Declare("using namespace FCCAnalyses;")
 
-    # Load geometry, needed for the CaloNtupleizer analyzers
-    geometry_file = get_attribute(analysis, 'geometry_path', None)
+    if config['geometry-path'] is not None and \
+            config['readout-name'] is not None:
+        ROOT.CaloNtupleizer.loadGeometry(config['geometry-path'],
+                                         config['readout-name'])
 
-    readout_name = get_attribute(analysis, 'readout_name', None)
+    if config['n-threads'] < 0:  # use all available threads
+        ROOT.EnableImplicitMT()
+        config['n-threads'] = ROOT.GetThreadPoolSize()
 
-    if geometry_file is not None and readout_name is not None:
-        ROOT.CaloNtupleizer.loadGeometry(geometry_file, readout_name)
-
-    # set multithreading (no MT if number of events is specified)
-    n_threads = 1
-    if args.nevents < 0:
-        if isinstance(args.ncpus, int) and args.ncpus >= 1:
-            n_threads = args.ncpus
-        else:
-            n_threads = get_attribute(analysis, "n_threads", 1)
-        if n_threads < 0:  # use all available threads
-            ROOT.EnableImplicitMT()
-            n_threads = ROOT.GetThreadPoolSize()
-
-        if n_threads > 1:
-            ROOT.ROOT.EnableImplicitMT(n_threads)
+    if config['n-threads'] > 1:
+        ROOT.ROOT.EnableImplicitMT(config['n-threads'])
 
     if ROOT.IsImplicitMTEnabled():
         ROOT.EnableThreadSafety()
         LOGGER.info('Multithreading enabled. Running over %i threads',
                     ROOT.GetThreadPoolSize())
     else:
-        LOGGER.info('No multithreading enabled. Running in single thread...')
+        LOGGER.info('No multithreading enabled. Running in a single thread...')
 
-    # custom header files
-    include_paths = get_attribute(analysis, 'include_paths', None)
-    if include_paths is not None:
+    # Additional include header files
+    if config['include-paths'] is not None:
+        # Check if the include paths exist
+        for path in config['include-paths']:
+            if not os.path.isfile(os.path.join(config['analysis-dir'], path)):
+                LOGGER.error('Include header file "%s" not found!'
+                             '\nAborting...', path)
+                sys.exit(3)
+
         ROOT.gInterpreter.ProcessLine(".O2")
-        basepath = os.path.dirname(os.path.abspath(args.anascript_path)) + "/"
-        for path in include_paths:
+        for path in config['include-paths']:
             LOGGER.info('Loading %s...', path)
-            ROOT.gInterpreter.Declare(f'#include "{basepath}/{path}"')
-
-
-# _____________________________________________________________________________
-def run_rdf(config: dict[str, any],
-            args,
-            analysis,
-            input_list: list[str],
-            out_file: str) -> int:
-    '''
-    Run the analysis ROOTDataFrame and snapshot it.
-    '''
-    # Create initial dataframe
-    if config['use_data_source']:
-        if ROOT.podio.DataSource:
-            LOGGER.debug('Found podio::DataSource.')
-        else:
-            LOGGER.error('podio::DataSource library not found!\nAborting...')
-            sys.exit(3)
-        LOGGER.info('Loading events through podio::DataSource...')
-
-        try:
-            dframe = ROOT.podio.CreateDataFrame(input_list)
-        except TypeError as excp:
-            LOGGER.error('Unable to build dataframe using '
-                         'podio::DataSource!\n%s', excp)
-            sys.exit(3)
-    else:
-        dframe = ROOT.RDataFrame("events", input_list)
-
-    # Limit number of events processed
-    if args.nevents > 0:
-        dframe2 = dframe.Range(0, args.nevents)
-    else:
-        dframe2 = dframe
-
-    try:
-        evtcount_init = dframe2.Count()
-        sow_init = evtcount_init
-        if config['do_weighted']:
-            sow_init = dframe2.Sum("EventHeader.weight")
-
-        dframe3 = analysis.analyzers(dframe2)
-
-        branch_list = ROOT.vector('string')()
-        blist = analysis.output()
-        for bname in blist:
-            branch_list.push_back(bname)
-
-        evtcount_final = dframe3.Count()
-        sow_final = evtcount_final
-        if config['do_weighted']:
-            sow_final = dframe3.Sum("EventHeader.weight")
-
-        # Generate computational graph of the analysis
-        if args.graph:
-            generate_graph(dframe, args)
-
-        dframe3.Snapshot("events", out_file, branch_list)
-    except Exception as excp:
-        LOGGER.error('During the execution of the analysis file exception '
-                     'occurred:\n%s', excp)
-        sys.exit(3)
-
-    return evtcount_init.GetValue(), evtcount_final.GetValue(), sow_init.GetValue(), sow_final.GetValue()
-
-
-# _____________________________________________________________________________
-def send_to_batch(args, analysis, chunk_list, sample_name, anapath: str):
-    '''
-    Send jobs to HTCondor batch system.
-    '''
-    local_dir = os.environ['LOCAL_DIR']
-    current_date = datetime.datetime.fromtimestamp(
-        datetime.datetime.now().timestamp()).strftime('%Y-%m-%d_%H-%M-%S')
-    log_dir = os.path.join(local_dir, 'BatchOutputs', current_date,
-                           sample_name)
-    if not os.path.exists(log_dir):
-        os.system(f'mkdir -p {log_dir}')
-
-    # Making sure the FCCAnalyses libraries are compiled and installed
-    try:
-        subprocess.check_output(['make', 'install'],
-                                cwd=local_dir+'/build',
-                                stderr=subprocess.DEVNULL
-                                )
-    except subprocess.CalledProcessError:
-        LOGGER.error('The FCCanalyses libraries are not properly build and '
-                     'installed!\nAborting job submission...')
-        sys.exit(3)
-
-    subjob_scripts = []
-    for ch_num in range(len(chunk_list)):
-        subjob_script_path = os.path.join(
-            log_dir,
-            f'job_{sample_name}_chunk_{ch_num}.sh')
-        subjob_scripts.append(subjob_script_path)
-
-        for i in range(3):
-            try:
-                with open(subjob_script_path, 'w', encoding='utf-8') as ofile:
-                    subjob_script = create_subjob_script(local_dir,
-                                                         analysis,
-                                                         sample_name,
-                                                         ch_num,
-                                                         chunk_list,
-                                                         anapath,
-                                                         args)
-                    ofile.write(subjob_script)
-            except IOError as err:
-                if i < 2:
-                    LOGGER.warning('I/O error(%i): %s',
-                                   err.errno, err.strerror)
-                else:
-                    LOGGER.error('I/O error(%i): %s', err.errno, err.strerror)
-                    sys.exit(3)
-            else:
-                break
-            time.sleep(10)
-        subprocess.getstatusoutput(f'chmod 777 {subjob_script_path}')
-
-    LOGGER.debug('Sub-job scripts to be run:\n - %s',
-                 '\n - '.join(subjob_scripts))
-
-    condor_config_path = f'{log_dir}/job_desc_{sample_name}.cfg'
-
-    for i in range(3):
-        try:
-            with open(condor_config_path, 'w', encoding='utf-8') as cfgfile:
-                condor_config = create_condor_config(log_dir,
-                                                     sample_name,
-                                                     determine_os(local_dir),
-                                                     analysis,
-                                                     subjob_scripts)
-                cfgfile.write(condor_config)
-        except IOError as err:
-            LOGGER.warning('I/O error(%i): %s', err.errno, err.strerror)
-            if i == 2:
+            success = ROOT.gInterpreter.Declare(
+                f'#include "{os.path.join(config["analysis-dir"], path)}"'
+            )
+            if not success:
+                LOGGER.error('Error occurred when JIT compiling "%s" include '
+                             'header file!\nAborting...', path)
                 sys.exit(3)
-        else:
-            break
-        time.sleep(10)
-    subprocess.getstatusoutput(f'chmod 777 {condor_config_path}')
 
-    batch_cmd = f'condor_submit {condor_config_path}'
-    LOGGER.info('Batch command:\n  %s', batch_cmd)
-    success = submit_job(batch_cmd, 10)
-    if not success:
-        sys.exit(3)
-
-
-# _____________________________________________________________________________
-def apply_filepath_rewrites(filepath: str) -> str:
-    '''
-    Apply path rewrites if applicable.
-    '''
-    # Stripping leading and trailing white spaces
-    filepath_stripped = filepath.strip()
-    # Stripping leading and trailing slashes
-    filepath_stripped = filepath_stripped.strip('/')
-
-    # Splitting the path along slashes
-    filepath_splitted = filepath_stripped.split('/')
-
-    if len(filepath_splitted) > 1 and filepath_splitted[0] == 'eos':
-        if filepath_splitted[1] == 'experiment':
-            filepath = 'root://eospublic.cern.ch//' + filepath_stripped
-        elif filepath_splitted[1] == 'user':
-            filepath = 'root://eosuser.cern.ch//' + filepath_stripped
-        elif 'home-' in filepath_splitted[1]:
-            filepath = 'root://eosuser.cern.ch//eos/user/' + \
-                       filepath_stripped.replace('eos/home-', '')
-        else:
-            LOGGER.warning('Unknown EOS path type!\nPlease check with the '
-                           'developers as this might impact performance of '
-                           'the analysis.')
-    return filepath
+    # Resolve test-file template if needed
+    if config.get('test-file') is not None and \
+            isinstance(config['test-file'], string.Template):
+        config['test-file'] = config['test-file'].substitute(
+            key4hep_os=config['key4hep-os'],
+            key4hep_stack=config['key4hep-stack'],
+            date=datetime.date.today().strftime('%Y-%m-%d')
+        )
 
 
 # _____________________________________________________________________________
-def run_local(config: dict[str, any],
-              args: object,
-              analysis: object,
-              infile_list):
-    '''
-    Run analysis locally.
-    '''
-    # Create list of files to be processed
-    info_msg = 'Creating dataframe object from files:\n'
-    file_list = ROOT.vector('string')()
-    # Amount of events processed in previous stage (= 0 if it is the first
-    # stage)
-    nevents_orig = 0
-    # The amount of events in the input file(s)
-    nevents_local = 0
-
-    # Same for the sum of weights
-    if config['do_weighted']:
-        sow_orig = 0.
-        sow_local = 0.
-
-    for filepath in infile_list:
-
-        if not config['use_data_source']:
-            filepath = apply_filepath_rewrites(filepath)
-
-        file_list.push_back(filepath)
-        info_msg += f'- {filepath}\t\n'
-
-        if config['do_weighted']:
-             # Adjust number of events in case --nevents was specified
-            if args.nevents > 0:
-                nevts_param, nevts_tree, sow_param, sow_tree = get_entries_sow(filepath, args.nevents)
-            else:
-                nevts_param, nevts_tree, sow_param, sow_tree = get_entries_sow(filepath)
-
-            nevents_orig += nevts_param
-            nevents_local += nevts_tree
-            sow_orig += sow_param
-            sow_local += sow_tree
-
-        else:
-            infile = ROOT.TFile.Open(filepath, 'READ')
-            try:
-                nevents_orig += infile.Get('eventsProcessed').GetVal()
-            except AttributeError:
-                pass
-
-            try:
-                nevents_local += infile.Get("events").GetEntries()
-            except AttributeError:
-                LOGGER.error('Input file:\n%s\nis missing events TTree!\n'
-                             'Aborting...', filepath)
-                infile.Close()
-                sys.exit(3)
-            infile.Close()
-
-             # Adjust number of events in case --nevents was specified
-            if args.nevents > 0 and args.nevents < nevents_local:
-                nevents_local = args.nevents
-
-
-    LOGGER.info(info_msg)
-
-   
-    if nevents_orig > 0:
-        LOGGER.info('Number of events:\n\t- original: %s\n\t- local:    %s',
-                    f'{nevents_orig:,}', f'{nevents_local:,}')
-        if config['do_weighted']:
-            LOGGER.info('Sum of weights:\n\t- original: %s\n\t- local:    %s',
-                        f'{sow_orig:,}', f'{sow_local:,}')
-    else:
-        LOGGER.info('Number of local events: %s', f'{nevents_local:,}')
-        if config['do_weighted']:
-            LOGGER.info('Local sum of weights: %s', f'{sow_local:0,.2f}')
-
-
-    output_dir = get_attribute(analysis, 'output_dir', '')
-    if not args.batch:
-        if os.path.isabs(args.output):
-            LOGGER.warning('Provided output path is absolute, "outputDir" '
-                           'from analysis script will be ignored!')
-        outfile_path = os.path.join(output_dir, args.output)
-    else:
-        outfile_path = args.output
-    LOGGER.info('Output file path:\n%s', outfile_path)
-
-    # Run RDF
-    start_time = time.time()
-    inn, outn, in_sow, out_sow = run_rdf(config, args, analysis, file_list, outfile_path)
-    elapsed_time = time.time() - start_time
-
-    # replace nevents_local by inn = the amount of processed events
-
-    info_msg = f"{' SUMMARY ':=^80}\n"
-    info_msg += 'Elapsed time (H:M:S):    '
-    info_msg += time.strftime('%H:%M:%S', time.gmtime(elapsed_time))
-    info_msg += '\nEvents processed/second: '
-    info_msg += f'{int(inn/elapsed_time):,}'
-    info_msg += f'\nTotal events processed:  {int(inn):,}'
-    info_msg += f'\nNo. result events:       {int(outn):,}'
-    if inn > 0:
-        info_msg += f'\nReduction factor local:  {outn/inn}'
-    if nevents_orig > 0:
-        info_msg += f'\nReduction factor total:  {outn/nevents_orig}'
-    if config['do_weighted']:
-        info_msg += f'\nTotal sum of weights processed:  {float(in_sow):0,.2f}'
-        info_msg += f'\nNo. result weighted events :       {float(out_sow):0,.2f}'
-        if in_sow > 0:
-            info_msg += f'\nReduction factor local, weighted:  {float(out_sow/in_sow):0,.4f}'
-        if sow_orig > 0:
-            info_msg += f'\nReduction factor total, weighted:  {float(out_sow/sow_orig):0,.4f}'
-    info_msg += '\n'
-    info_msg += 80 * '='
-    info_msg += '\n'
-    LOGGER.info(info_msg)
-
-    # Update resulting root file with number of processed events
-    # and number of selected events
-    with ROOT.TFile(outfile_path, 'update') as outfile:
-        param = ROOT.TParameter(int)(
-                'eventsProcessed',
-                nevents_orig if nevents_orig != 0 else inn)
-        param.Write()
-        param = ROOT.TParameter(int)('eventsSelected', outn) 
-        param.Write()
-
-        if config['do_weighted']:
-            param_sow = ROOT.TParameter(float)( 
-                        'SumOfWeights', 
-                        sow_orig if sow_orig != 0 else in_sow )
-            param_sow.Write()
-            param_sow = ROOT.TParameter(float)('SumOfWeightsSelected', out_sow) # No of weighted, selected events
-            param_sow.Write()
-        outfile.Write()
-
-    if args.bench:
-        analysis_name = get_attribute(analysis,
-                                      'analysis_name', args.anascript_path)
-
-        bench_time = {}
-        bench_time['name'] = 'Time spent running the analysis: '
-        bench_time['name'] += analysis_name
-        bench_time['unit'] = 'Seconds'
-        bench_time['value'] = elapsed_time
-        bench_time['range'] = 10
-        bench_time['extra'] = 'Analysis path: ' + args.anascript_path
-        save_benchmark('benchmarks_smaller_better.json', bench_time)
-
-        bench_evt_per_sec = {}
-        bench_evt_per_sec['name'] = 'Events processed per second: '
-        bench_evt_per_sec['name'] += analysis_name
-        bench_evt_per_sec['unit'] = 'Evt/s'
-        bench_evt_per_sec['value'] = nevents_local / elapsed_time
-        bench_time['range'] = 1000
-        bench_time['extra'] = 'Analysis path: ' + args.anascript_path
-        save_benchmark('benchmarks_bigger_better.json', bench_evt_per_sec)
-
-
-# _____________________________________________________________________________
-def run_fccanalysis(args, analysis_module):
+def run_fccanalysis(args, anascript_module) -> None:
     '''
     Run analysis of style "Analysis".
     '''
+    config: dict[str, Any] = {}
 
     # Get analysis class out of the module
-    analysis_args = vars(args)
-    analysis = analysis_module.Analysis(analysis_args)
+    # Also, execute the "constructor" of the analysis class
+    LOGGER.info('Initializing analysis class...')
+    config |= validate_analysis_class(anascript_module.Analysis(vars(args)))
 
+    LOGGER.info('Setting run parameters...')
     # Merge configuration from command line arguments and analysis class
-    config: dict[str, any] = merge_config(args, analysis)
+    config |= merge_config(args, config['analysis-class'])
 
-    # Set number of threads, load header files, custom dicts, ...
-    initialize(config, args, analysis_module)
+    # Set number of threads, load header files, ...
+    global_setup(config)
 
-    # Check if output directory exist and if not create it
-    output_dir = get_attribute(analysis, 'output_dir', None)
-    if output_dir is not None and not os.path.exists(output_dir):
-        os.system(f'mkdir -p {output_dir}')
+    # Generate jobs to be run
+    jobs = generate_jobs(config)
 
-    # Check if eos output directory exist and if not create it
-    output_dir_eos = get_attribute(analysis, 'output_dir_eos', None)
-    if output_dir_eos is not None and not os.path.exists(output_dir_eos):
-        os.system(f'mkdir -p {output_dir_eos}')
+    if len(jobs) <= 0:
+        LOGGER.error('No jobs to be executed!\nAborting...')
+        sys.exit(3)
+    elif len(jobs) == 1:
+        LOGGER.info('Will execute 1 job...')
+    else:
+        LOGGER.info('Will execute %i jobs...', len(jobs))
 
-    if config['do_weighted']:
-        LOGGER.info('Using generator weights')
+    total_events = 0
+    total_elapsed_time = 0.
 
-    # Check if test mode is specified, and if so run the analysis on it (this
-    # will exit after)
-    if args.test:
-        LOGGER.info('Running over test file...')
-        testfile_path = getattr(analysis, "test_file")
-        directory, _ = os.path.split(args.output)
+    for job in jobs:
+        LOGGER.info('Starting job: %s ...', job['name'])
+        directory, _ = os.path.split(job['output-file'])
         if directory:
             os.system(f'mkdir -p {directory}')
-        run_local(config, args, analysis, [testfile_path])
-        sys.exit(0)
 
-    # Check if files are specified, and if so run the analysis on it/them (this
-    # will exit after)
-    if len(args.files_list) > 0:
-        LOGGER.info('Running over files provided in command line argument...')
-        directory, _ = os.path.split(args.output)
-        if directory:
-            os.system(f'mkdir -p {directory}')
-        run_local(config, args, analysis, args.files_list)
-        sys.exit(0)
+        dframe_job = Job(job['input-file-list'],
+                         config['analysis-chain'],
+                         config['use-data-source'])
 
-    # Check if batch mode is available
-    run_batch = get_attribute(analysis, 'run_batch', False)
-    if run_batch and shutil.which('condor_q') is None:
-        LOGGER.error('HTCondor tools can\'t be found!\nAborting...')
-        sys.exit(3)
+        dframe_job.setup_output(job['output-file'],
+                                config['output-variables'])
 
-    # Check if the process list is specified
-    process_list = get_attribute(analysis, 'process_list', [])
+        if config['enable-progress-bar']:
+            dframe_job.enable_progress_bar()
 
-    prod_tag = get_attribute(analysis, 'prod_tag', None)
+        dframe_job.restrict_events(job['n-events-max'],
+                                   job['stride'])
 
-    input_dir = get_attribute(analysis, 'input_dir', None)
+        dframe_job.run()
 
-    if prod_tag is None and input_dir is None:
-        LOGGER.error('No input directory or production tag specified in the '
-                     'analysis script!\nAborting...')
-        sys.exit(3)
+        dframe_job.finalize()
 
+        if config['generate-graph']:
+            dframe_job.generate_analysis_graph(config['graph-path'])
 
+        n_events, elapsed_time = dframe_job.get_benchmark_info()
+        total_events += n_events
+        total_elapsed_time += elapsed_time
 
-    for process_name in process_list:
-        LOGGER.info('Started processing sample "%s" ...', process_name)
-        file_list, event_list = get_process_info(process_name,
-                                                 prod_tag,
-                                                 input_dir)
+    if config['bench']:
+        analysis_name = config['analysis-name'] or config['anascript-path']
 
-        if len(file_list) <= 0:
-            LOGGER.error('No files to process!\nAborting...')
-            sys.exit(3)
+        bench_time = {}
+        bench_time['name'] = 'Time spent running the analysis: ' + \
+                             analysis_name
+        bench_time['unit'] = 'Seconds'
+        bench_time['value'] = total_elapsed_time
+        bench_time['range'] = 10
+        bench_time['extra'] = 'Analysis path: ' + config['anascript-path']
+        save_benchmark('benchmarks_smaller_better.json', bench_time)
 
-        # Determine the fraction of the input to be processed
-        fraction = 1
-        if get_element_dict(process_list[process_name], 'fraction'):
-            fraction = get_element_dict(process_list[process_name], 'fraction')
-        # Put together output path
-        output_stem = process_name
-        if get_element_dict(process_list[process_name], 'output'):
-            output_stem = get_element_dict(process_list[process_name],
-                                           'output')
-        # Determine the number of chunks the output will be split into
-        chunks = 1
-        if get_element_dict(process_list[process_name], 'chunks'):
-            chunks = get_element_dict(process_list[process_name], 'chunks')
-
-        info_msg = f'Adding process "{process_name}" with:'
-        if fraction < 1:
-            info_msg += f'\n\t- fraction:         {fraction}'
-        info_msg += f'\n\t- number of files:  {len(file_list):,}'
-        info_msg += f'\n\t- output stem:      {output_stem}'
-        if chunks > 1:
-            info_msg += f'\n\t- number of chunks: {chunks}'
-
-        if fraction < 1:
-            file_list = get_subfile_list(file_list, event_list, fraction)
-
-        chunk_list = [file_list]
-        if chunks > 1:
-            chunk_list = get_chunk_list(file_list, chunks)
-        LOGGER.info('Number of the output files: %s', f'{len(chunk_list):,}')
-
-        # Create directory if more than 1 chunk
-        if len(chunk_list) > 1:
-            output_directory = os.path.join(output_dir if output_dir else '',
-                                            output_stem)
-
-            if not os.path.exists(output_directory):
-                os.system(f'mkdir -p {output_directory}')
-
-        if run_batch:
-            # Sending to the batch system
-            LOGGER.info('Running on the batch...')
-            if len(chunk_list) == 1:
-                LOGGER.warning('\033[4m\033[1m\033[91mRunning on batch with '
-                               'only one chunk might not be optimal\033[0m')
-
-            anapath = os.path.abspath(args.anascript_path)
-
-            send_to_batch(args, analysis, chunk_list, process_name, anapath)
-
-        else:
-            # Running locally
-            LOGGER.info('Running locally...')
-            if len(chunk_list) == 1:
-                args.output = f'{output_stem}.root'
-                run_local(config, args, analysis, chunk_list[0])
-            else:
-                for index, chunk in enumerate(chunk_list):
-                    args.output = f'{output_stem}/chunk{index}.root'
-                    run_local(config, args, analysis, chunk)
-
-    if len(process_list) == 0:
-        LOGGER.warning('No files processed (process_list not found)!\n'
-                       'Exiting...')
+        bench_evt_per_sec = {}
+        bench_evt_per_sec['name'] = 'Events processed per second: ' + \
+                                    analysis_name
+        bench_evt_per_sec['unit'] = 'Evt/s'
+        bench_evt_per_sec['value'] = total_events / total_elapsed_time
+        bench_evt_per_sec['range'] = 1000
+        bench_evt_per_sec['extra'] = 'Analysis path: ' + \
+                                     config['anascript-path']
+        save_benchmark('benchmarks_bigger_better.json', bench_evt_per_sec)

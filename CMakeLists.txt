@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16.9)
 
 
-project(FCCAnalyses VERSION 0.10.0
+project(FCCAnalyses VERSION 0.12.0
                     LANGUAGES CXX
 )
 
@@ -25,8 +25,6 @@ set_property(CACHE WITH_DD4HEP PROPERTY STRINGS AUTO ON OFF)
 set(WITH_ONNX AUTO CACHE STRING "Build analyzers that need ONNXRuntime")
 set_property(CACHE WITH_ONNX PROPERTY STRINGS AUTO ON OFF)
 
-option(FCCANALYSES_CASESTUDIES "Build the case studies" OFF)
-
 option(USE_EXTERNAL_CATCH2 "Link against an external Catch2 v3 static library, otherwise build it locally" ON)
 
 option(FCCANALYSES_DOCUMENTATION "Whether or not to create doxygen doc target." ON)
@@ -49,7 +47,9 @@ include(GNUInstallDirs)
 set(INSTALL_LIB_DIR lib CACHE PATH "Installation directory for libraries")
 set(INSTALL_BIN_DIR bin CACHE PATH "Installation directory for executables")
 set(INSTALL_INCLUDE_DIR include CACHE PATH
-  "Installation directory for header files")
+    "Installation directory for header files")
+set(INSTALL_SHARE_DIR "${CMAKE_INSTALL_PREFIX}/share" CACHE PATH
+    "Installation directory for shared resources")
 
 
 #--- Declare C++ Standard -----------------------------------------------------
@@ -68,7 +68,7 @@ find_package(TBB REQUIRED COMPONENTS tbb)
 
 # need to use our own FindFastJet.cmake
 set(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake ${CMAKE_MODULE_PATH})
-find_package(FastJet)
+find_package(FastJet REQUIRED)
 
 find_package( Delphes REQUIRED )
 
@@ -134,8 +134,7 @@ if(WITH_ONNX AND BUILD_TESTING) # currently these files are only needed by ONNX-
   endif()
 endif()
 
-#--- add CMake infrastructure --------------------------------------------------
-include(cmake/FCCAnalysesCreateConfig.cmake)
+#--- add CMake infrastructure -------------------------------------------------
 include(cmake/FCCAnalysesFunctions.cmake)
 
 file(COPY bin/fccanalysis
@@ -154,7 +153,6 @@ install(FILES ${_man_files_1} DESTINATION ${CMAKE_INSTALL_PREFIX}/share/man/man1
 file(GLOB _man_files_7 man/man7/*.7)
 install(FILES ${_man_files_7} DESTINATION ${CMAKE_INSTALL_PREFIX}/share/man/man7)
 
-
 install(DIRECTORY examples DESTINATION ${CMAKE_INSTALL_PREFIX}/share/examples)
 
 #--- Descend into subdirectories ----------------------------------------------
@@ -163,14 +161,8 @@ set(ADDONS_LIBRARIES CACHE STRING "List of external libraries the RDF utilities 
 add_subdirectory(addons)
 add_subdirectory(analyzers/dataframe)
 
-add_subdirectory(case-studies)
-if(FCCANALYSES_CASESTUDIES)
-  add_subdirectory(analyzers/dataframe/case-studies FCCANALYSES_CASESTUDIES)
-endif()
-
-
 if(FCCANALYSES_DOCUMENTATION)
-  include(cmake/FCCANALYSESDoxygen.cmake)
+  include(cmake/FCCAnalysesDoxygen.cmake)
 endif()
 
 if(BUILD_TESTING)
