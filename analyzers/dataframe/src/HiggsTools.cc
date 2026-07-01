@@ -992,6 +992,60 @@ ROOT::VecOps::RVec<double>  HiggsTools::coneIsolation::coneIsolation::operator()
   return result;
 }
 
+coneIsolationTheta::coneIsolationTheta(float arg_dr_min, float arg_dr_max) : dr_min(arg_dr_min), dr_max( arg_dr_max ) { };
+
+ROOT::VecOps::RVec<double>  HiggsTools::coneIsolationTheta::coneIsolationTheta::operator() (ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> recop,
+                                 ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> rp) {
+
+  ROOT::VecOps::RVec<double> result;
+  result.reserve(recop.size());
+
+  std::vector<TLorentzVector> lv_reco;
+  std::vector<TLorentzVector> lv_charged;
+  std::vector<TLorentzVector> lv_neutral;
+
+  for(size_t i = 0; i < rp.size(); ++i) {
+
+    TLorentzVector tlv;
+    tlv.SetPxPyPzE(rp.at(i).momentum.x, rp.at(i).momentum.y, rp.at(i).momentum.z, rp.at(i).energy);
+
+    if(rp.at(i).charge == 0) lv_neutral.push_back(tlv);
+    else lv_charged.push_back(tlv);
+  }
+
+  for(size_t i = 0; i < recop.size(); ++i) {
+
+    TLorentzVector tlv;
+    tlv.SetPxPyPzE(recop.at(i).momentum.x, recop.at(i).momentum.y, recop.at(i).momentum.z, recop.at(i).energy);
+    lv_reco.push_back(tlv);
+  }
+
+  // identical to coneIsolation, except the cone distance uses polar angle (theta) instead of eta
+  for (auto & lv_reco_ : lv_reco) {
+
+    double sumNeutral = 0.0;
+    double sumCharged = 0.0;
+
+    // charged
+    for (auto & lv_charged_ : lv_charged) {
+      double dr = coneIsolationTheta::deltaR(lv_reco_.Theta(), lv_reco_.Phi(), lv_charged_.Theta(), lv_charged_.Phi());
+      if(dr > dr_min && dr < dr_max) sumCharged += lv_charged_.P();
+    }
+
+    // neutral
+    for (auto & lv_neutral_ : lv_neutral) {
+
+      double dr = coneIsolationTheta::deltaR(lv_reco_.Theta(), lv_reco_.Phi(), lv_neutral_.Theta(), lv_neutral_.Phi());
+      if(dr > dr_min && dr < dr_max) sumNeutral += lv_neutral_.P();
+    }
+
+    double sum = sumCharged + sumNeutral;
+    double ratio= sum / lv_reco_.P();
+    result.emplace_back(ratio);
+  }
+  return result;
+}
+
 std::vector<float> HiggsTools::gen_p_from_reco(ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> legs, ROOT::VecOps::RVec<int> recind, ROOT::VecOps::RVec<int> mcind, ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> reco, ROOT::VecOps::RVec<edm4hep::MCParticleData> mc) {
 
   std::vector<float> result;
