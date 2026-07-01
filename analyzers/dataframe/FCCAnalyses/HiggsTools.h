@@ -124,7 +124,23 @@ namespace HiggsTools{
 
     float dr_min = 0;
     float dr_max = 0.4;
-    ROOT::VecOps::RVec<double>  operator() ( ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> recop, 
+    ROOT::VecOps::RVec<double>  operator() ( ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> recop,
+                                             ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> rp) ;
+  };
+
+  // Same as coneIsolation, but the cone distance is built from the polar angle (theta)
+  // instead of pseudorapidity (eta): dR = sqrt(dTheta^2 + dPhi^2). theta is the natural
+  // angular variable at an e+e- collider, so this makes the metric consistent (referee
+  // request). The eta-based coneIsolation remains for backward compatibility.
+  struct coneIsolationTheta {
+
+    coneIsolationTheta(float arg_dr_min, float arg_dr_max);
+
+    double deltaR(double theta1, double phi1, double theta2, double phi2) { return TMath::Sqrt(TMath::Power(theta1-theta2, 2) + (TMath::Power(phi1-phi2, 2))); };
+
+    float dr_min = 0;
+    float dr_max = 0.4;
+    ROOT::VecOps::RVec<double>  operator() ( ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> recop,
                                              ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> rp) ;
   };
 
