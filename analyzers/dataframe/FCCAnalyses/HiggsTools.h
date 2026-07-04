@@ -264,5 +264,59 @@ namespace HiggsTools{
   ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> visible(ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> in, float p_cutoff = 0.0);
 
   float ZHChi2(float mZ, float mH, float chi2_H_frac = 0.5);
+
+  // ------------------------------------------------------------------
+  // ZH hadronic (Z->qq) helpers, ported from jeyserma/FCCPhysics
+  // (analyses/h_zh/utils_hadronic.h, utils.h and functions/functions.h)
+  // ------------------------------------------------------------------
+
+  /// convert clustered jets (px, py, pz, E, m vectors) to ReconstructedParticleData
+  ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> jets2rp(ROOT::VecOps::RVec<float> px, ROOT::VecOps::RVec<float> py, ROOT::VecOps::RVec<float> pz, ROOT::VecOps::RVec<float> e, ROOT::VecOps::RVec<float> m);
+
+  /// jet quality selection (p > 5 GeV), can reduce the jet multiplicity
+  ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> select_jets(ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> in, std::vector<std::vector<int>> constituents, int njets_sel, ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> reco);
+
+  /// pick the best clustering hypothesis (inclusive, N=2, 4, 6) via a chi2 on m(qq), p(qq), recoil
+  int best_clustering_idx(ROOT::VecOps::RVec<float> mz, ROOT::VecOps::RVec<float> pz, ROOT::VecOps::RVec<float> mrec, ROOT::VecOps::RVec<int> njets, ROOT::VecOps::RVec<int> njets_target, int ecm = 240);
+
+  /// build the Z(qq) resonance from the jet pair minimizing a chi2 on mass, recoil and momentum
+  struct resonanceBuilder_mass_recoil_hadronic {
+    float m_resonance_mass;
+    float m_recoil_mass;
+    float chi2_recoil_frac;
+    float ecm;
+    resonanceBuilder_mass_recoil_hadronic(float arg_resonance_mass, float arg_recoil_mass, float arg_chi2_recoil_frac, float arg_ecm);
+    ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> operator()(ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> legs);
+  };
+
+  /// pair 4 jets into two W candidates minimizing the (mW, mW) chi2
+  ROOT::VecOps::RVec<TLorentzVector> pair_WW_N4(ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> in);
+
+  /// MC truth: inclusive WW event where both Ws decay to the same lepton flavor (e or mu, incl. via tau)
+  bool is_ww_leptonic(ROOT::VecOps::RVec<edm4hep::MCParticleData> mc, ROOT::VecOps::RVec<int> ind);
+
+  /// MC truth: H->ZZ event with both Zs decaying invisibly
+  bool is_hzz_invisible(ROOT::VecOps::RVec<edm4hep::MCParticleData> mc, ROOT::VecOps::RVec<int> ind);
+
+  /// filter reco particles based on a property within (min, max); abs = compare |prop|
+  struct sel_range {
+    sel_range(float arg_min, float arg_max, bool arg_abs = false);
+    float m_min = 0.;
+    float m_max = 1.;
+    bool m_abs = false;
+    ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> operator()(ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> in, ROOT::VecOps::RVec<float> prop);
+  };
+
+  /// 3D acolinearity acos(-v1.v2/|v1||v2|) between the two leading particles (FCCPhysics definition, scalar)
+  float acolinearity_scalar(ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> in);
+
+  /// acoplanarity pi - |dphi| between the two leading particles (scalar)
+  float acoplanarity_scalar(ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> in);
+
+  /// missing-energy four-vector from the visible reco particles
+  ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> missingEnergy(float ecm, ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> in, float p_cutoff = 0.0);
+
+  /// |cos(theta)| of the missing-energy vector
+  float get_cosTheta_miss(ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> met);
 }
 #endif

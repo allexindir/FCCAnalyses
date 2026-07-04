@@ -1894,3 +1894,295 @@ float HiggsTools::ZHChi2(float mZ, float mH, float chi2_H_frac) {
   float chi2 = (1.0-chi2_H_frac)*chiZ + chi2_H_frac*chiH;
   return chi2;
 }
+// ------------------------------------------------------------------
+// ZH hadronic (Z->qq) helpers, ported from jeyserma/FCCPhysics
+// (analyses/h_zh/utils_hadronic.h, utils.h and functions/functions.h)
+// ------------------------------------------------------------------
+
+namespace {
+// chi2 weights and <p(Z)> per sqrt(s) used by the hadronic Z builder / clustering choice
+constexpr float zqq_frac_mz_240 = 1.0, zqq_frac_pz_240 = 1.0, zqq_frac_rec_240 = 1.0, zqq_pz_240 = 52;
+constexpr float zqq_frac_mz_365 = 5.0, zqq_frac_pz_365 = 1.0, zqq_frac_rec_365 = 1.0, zqq_pz_365 = 143;
+}
+
+ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> HiggsTools::jets2rp(ROOT::VecOps::RVec<float> px, ROOT::VecOps::RVec<float> py, ROOT::VecOps::RVec<float> pz, ROOT::VecOps::RVec<float> e, ROOT::VecOps::RVec<float> m) {
+    ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> ret;
+    for(size_t i = 0; i < px.size(); i++) {
+        edm4hep::ReconstructedParticleData p;
+        p.momentum.x = px[i];
+        p.momentum.y = py[i];
+        p.momentum.z = pz[i];
+        p.mass = m[i];
+        p.energy = e[i];
+        p.charge = 0;
+        ret.push_back(p);
+    }
+    return ret;
+}
+
+ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> HiggsTools::select_jets(ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> in, std::vector<std::vector<int>> constituents, int njets_sel, ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> reco) {
+    ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> ret;
+    for(size_t i = 0; i < in.size(); i++) {
+        float p = std::sqrt(in[i].momentum.x*in[i].momentum.x + in[i].momentum.y*in[i].momentum.y + in[i].momentum.z*in[i].momentum.z);
+        if(p < 5) continue; // at least 5 GeV momentum
+        ret.push_back(in[i]);
+    }
+    return ret;
+}
+
+int HiggsTools::best_clustering_idx(ROOT::VecOps::RVec<float> mz, ROOT::VecOps::RVec<float> pz, ROOT::VecOps::RVec<float> mrec, ROOT::VecOps::RVec<int> njets, ROOT::VecOps::RVec<int> njets_target, int ecm) {
+    float frac_mz = 1.0, frac_pz = 1.0, frac_rec = 1.0, pz_ = 52;
+    if(ecm == 240) { frac_mz = zqq_frac_mz_240; frac_pz = zqq_frac_pz_240; frac_rec = zqq_frac_rec_240; pz_ = zqq_pz_240; }
+    if(ecm == 365) { frac_mz = zqq_frac_mz_365; frac_pz = zqq_frac_pz_365; frac_rec = zqq_frac_rec_365; pz_ = zqq_pz_365; }
+
+    float mz_ = 91.2;
+    float mh_ = 125.0;
+
+    ROOT::VecOps::RVec<float> chi2;
+    for(size_t i = 0; i < mz.size(); i++) {
+        float c = frac_mz*std::pow(mz[i] - mz_, 2) + frac_rec*std::pow(mrec[i] - mh_, 2) + frac_pz*std::pow(pz[i] - pz_, 2);
+        if(i==0 && njets[0] < 2) c = 9e99;
+        else if(i > 0 && njets[i] != njets_target[i]) c = 9e99;
+        chi2.push_back(c);
+    }
+
+    // the number of good candidate jets must be at least 2 to form a good Z candidate
+    // (sometimes exclusive clustering gives the wrong njets)
+    int min_dx = std::distance(std::begin(chi2), std::min_element(std::begin(chi2), std::end(chi2)));
+    if(min_dx == 0 and njets[0] >= 2) return 0; // requirement for inclusive clustering
+    else if(njets[min_dx] == njets_target[min_dx] && min_dx != 0) return min_dx; // requirement for exclusive clustering
+    else return -1; // could not cluster
+}
+
+HiggsTools::resonanceBuilder_mass_recoil_hadronic::resonanceBuilder_mass_recoil_hadronic(float arg_resonance_mass, float arg_recoil_mass, float arg_chi2_recoil_frac, float arg_ecm) {m_resonance_mass = arg_resonance_mass, m_recoil_mass = arg_recoil_mass, chi2_recoil_frac = arg_chi2_recoil_frac, ecm = arg_ecm;}
+ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> HiggsTools::resonanceBuilder_mass_recoil_hadronic::operator()(ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> legs) {
+    float frac_mz = 1.0, frac_pz = 1.0, frac_rec = 1.0, pz_ = 52;
+    if(ecm == 240) { frac_mz = zqq_frac_mz_240; frac_pz = zqq_frac_pz_240; frac_rec = zqq_frac_rec_240; pz_ = zqq_pz_240; }
+    if(ecm == 365) { frac_mz = zqq_frac_mz_365; frac_pz = zqq_frac_pz_365; frac_rec = zqq_frac_rec_365; pz_ = zqq_pz_365; }
+
+    ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> result;
+    result.reserve(3);
+    std::vector<std::vector<int>> pairs; // for each permutation, the indices of the two jets
+    int n = legs.size();
+    if(n > 1) {
+        ROOT::VecOps::RVec<bool> v(n);
+        std::fill(v.end() - 2, v.end(), true); // helper variable for permutations
+        do {
+            std::vector<int> pair;
+            edm4hep::ReconstructedParticleData reso;
+            reso.charge = 0;
+            TLorentzVector reso_lv;
+            for(int i = 0; i < n; ++i) {
+                if(v[i]) {
+                    pair.push_back(i);
+                    TLorentzVector leg_lv;
+                    leg_lv.SetXYZM(legs[i].momentum.x, legs[i].momentum.y, legs[i].momentum.z, legs[i].mass);
+                    reso_lv += leg_lv;
+                }
+            }
+            reso.momentum.x = reso_lv.Px();
+            reso.momentum.y = reso_lv.Py();
+            reso.momentum.z = reso_lv.Pz();
+            reso.mass = reso_lv.M();
+            result.emplace_back(reso);
+            pairs.push_back(pair);
+        } while(std::next_permutation(v.begin(), v.end()));
+    }
+    else {
+        // fewer than 2 jets: return dummies; downstream best_clustering_idx rejects
+        // this hypothesis (njets < 2), the values are never used
+        result.resize(3, edm4hep::ReconstructedParticleData());
+        return result;
+    }
+
+    if(result.size() > 1) {
+        ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> bestReso;
+        int idx_min = -1;
+        float d_min = 9e9;
+        for(size_t i = 0; i < result.size(); ++i) {
+            // calculate recoil
+            auto recoil_p4 = TLorentzVector(0, 0, 0, ecm);
+            TLorentzVector tv1;
+            tv1.SetXYZM(result.at(i).momentum.x, result.at(i).momentum.y, result.at(i).momentum.z, result.at(i).mass);
+            recoil_p4 -= tv1;
+
+            float recoil_mass = recoil_p4.M();
+            float momentum = tv1.P();
+            float mass = frac_mz*std::pow(result.at(i).mass - m_resonance_mass, 2); // mass
+            float rec = frac_rec*std::pow(recoil_mass - m_recoil_mass, 2);          // recoil
+            float p = frac_pz*std::pow(momentum - pz_, 2);                          // momentum
+            float d = mass + rec + p;
+            if(d < d_min) {
+                d_min = d;
+                idx_min = i;
+            }
+        }
+        if(idx_min > -1) {
+            bestReso.push_back(result.at(idx_min));
+            auto & l1 = legs[pairs[idx_min][0]];
+            auto & l2 = legs[pairs[idx_min][1]];
+            bestReso.emplace_back(l1);
+            bestReso.emplace_back(l2);
+        }
+        else {
+            std::cout << "ERROR: resonanceBuilder_mass_recoil_hadronic, no minimum found." << std::endl;
+            exit(1);
+        }
+        return bestReso;
+    }
+    else {
+        auto & l1 = legs[0];
+        auto & l2 = legs[1];
+        result.emplace_back(l1);
+        result.emplace_back(l2);
+        return result;
+    }
+}
+
+ROOT::VecOps::RVec<TLorentzVector> HiggsTools::pair_WW_N4(ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> in) {
+    ROOT::VecOps::RVec<TLorentzVector> ret;
+    // guard: exclusive N=4 clustering can yield fewer jets after the quality selection
+    if(in.size() < 4) {
+        ret.push_back(TLorentzVector());
+        ret.push_back(TLorentzVector());
+        return ret;
+    }
+
+    TLorentzVector j1, j2, j3, j4, W1, W2;
+    j1.SetXYZM(in[0].momentum.x, in[0].momentum.y, in[0].momentum.z, in[0].mass);
+    j2.SetXYZM(in[1].momentum.x, in[1].momentum.y, in[1].momentum.z, in[1].mass);
+    j3.SetXYZM(in[2].momentum.x, in[2].momentum.y, in[2].momentum.z, in[2].mass);
+    j4.SetXYZM(in[3].momentum.x, in[3].momentum.y, in[3].momentum.z, in[3].mass);
+
+    float chi2_1 = std::pow((j1+j2).M()-80.0, 2) + std::pow((j3+j4).M()-80.0, 2);
+    float chi2_2 = std::pow((j1+j3).M()-80.0, 2) + std::pow((j2+j4).M()-80.0, 2);
+    float chi2_3 = std::pow((j1+j4).M()-80.0, 2) + std::pow((j2+j3).M()-80.0, 2);
+
+    if(chi2_1<chi2_2 && chi2_1<chi2_3)      { W1 = j1+j2; W2 = j3+j4; }
+    else if(chi2_2<chi2_1 && chi2_2<chi2_3) { W1 = j1+j3; W2 = j2+j4; }
+    else                                    { W1 = j1+j4; W2 = j2+j3; }
+
+    ret.push_back(W1);
+    ret.push_back(W2);
+    return ret;
+}
+
+bool HiggsTools::is_ww_leptonic(ROOT::VecOps::RVec<edm4hep::MCParticleData> mc, ROOT::VecOps::RVec<int> ind) {
+   int l1 = 0;
+   int l2 = 0;
+   for(size_t i = 0; i < mc.size(); ++i) {
+        auto & p = mc[i];
+        if(std::abs(p.PDG) == 24) {
+            int ds = p.daughters_begin;
+            int de = p.daughters_end;
+            for(int k=ds; k<de; k++) {
+                int pdg = abs(mc[ind[k]].PDG);
+                if(pdg == 24) continue;
+                if(pdg == 11 or pdg == 13) {
+                    if(l1 == 0) l1 = pdg;
+                    else l2 = pdg;
+                }
+            }
+        }
+        else if(std::abs(p.PDG) == 15) { // tau decays
+            int ds = p.daughters_begin;
+            int de = p.daughters_end;
+            for(int k=ds; k<de; k++) {
+                int pdg = abs(mc[ind[k]].PDG);
+                if(pdg == 15) continue;
+                if(pdg == 11 or pdg == 13) {
+                    if(l1 == 0) l1 = pdg;
+                    else l2 = pdg;
+                }
+            }
+        }
+   }
+   if(l1 == l2 && (l1==13 || l1 == 11)) return true;
+   return false;
+}
+
+bool HiggsTools::is_hzz_invisible(ROOT::VecOps::RVec<edm4hep::MCParticleData> mc, ROOT::VecOps::RVec<int> ind) {
+   int d1 = 0;
+   int d2 = 0;
+   for(size_t i = 0; i < mc.size(); ++i) {
+        auto & p = mc[i];
+        if(std::abs(p.PDG) != 23) continue;
+
+        int ds = p.daughters_begin;
+        int de = p.daughters_end;
+        int idx_ds = ind[ds];
+        int idx_de = ind[de-1];
+        int pdg_d1 = abs(mc[idx_ds].PDG);
+        int pdg_d2 = abs(mc[idx_de].PDG);
+
+        if(std::abs(pdg_d1) == 23 or std::abs(pdg_d2) == 23) continue;
+        if(d1 == 0) d1 += pdg_d1 + pdg_d2;
+        else d2 += pdg_d1 + pdg_d2;
+   }
+   // 24/28/32 = nu_e/nu_mu/nu_tau pair PDG sums
+   if((d1==24 || d1==28 || d1==32) && (d2==24 || d2==28 || d2==32)) return true;
+   return false;
+}
+
+HiggsTools::sel_range::sel_range(float arg_min, float arg_max, bool arg_abs) : m_min(arg_min), m_max(arg_max), m_abs(arg_abs) {};
+ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> HiggsTools::sel_range::operator()(ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> in, ROOT::VecOps::RVec<float> prop) {
+    ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> result;
+    for(size_t i = 0; i < in.size(); ++i) {
+        auto & p = in[i];
+        float val = (m_abs) ? std::abs(prop[i]) : prop[i];
+        if(val > m_min && val < m_max) result.push_back(p);
+    }
+    return result;
+}
+
+ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> HiggsTools::missingEnergy(float ecm, ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> in, float p_cutoff) {
+    float px = 0, py = 0, pz = 0, e = 0;
+    for(auto &p : in) {
+        if(std::sqrt(p.momentum.x * p.momentum.x + p.momentum.y*p.momentum.y) < p_cutoff) continue;
+        px += -p.momentum.x;
+        py += -p.momentum.y;
+        pz += -p.momentum.z;
+        e += p.energy;
+    }
+    ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> ret;
+    edm4hep::ReconstructedParticleData res;
+    res.momentum.x = px;
+    res.momentum.y = py;
+    res.momentum.z = pz;
+    res.energy = ecm-e;
+    ret.emplace_back(res);
+    return ret;
+}
+
+float HiggsTools::get_cosTheta_miss(ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> met) {
+    float costheta = 0.;
+    if(met.size() > 0) {
+        TLorentzVector lv_met;
+        lv_met.SetPxPyPzE(met[0].momentum.x, met[0].momentum.y, met[0].momentum.z, met[0].energy);
+        costheta = fabs(std::cos(lv_met.Theta()));
+    }
+    return costheta;
+}
+
+float HiggsTools::acolinearity_scalar(ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> in) {
+    if(in.size() < 2) return -999;
+    TLorentzVector p1;
+    p1.SetXYZM(in[0].momentum.x, in[0].momentum.y, in[0].momentum.z, in[0].mass);
+    TLorentzVector p2;
+    p2.SetXYZM(in[1].momentum.x, in[1].momentum.y, in[1].momentum.z, in[1].mass);
+    TVector3 v1 = p1.Vect();
+    TVector3 v2 = p2.Vect();
+    return std::acos(v1.Dot(v2)/(v1.Mag()*v2.Mag())*(-1.));
+}
+
+float HiggsTools::acoplanarity_scalar(ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> in) {
+    if(in.size() < 2) return -999;
+    TLorentzVector p1;
+    p1.SetXYZM(in[0].momentum.x, in[0].momentum.y, in[0].momentum.z, in[0].mass);
+    TLorentzVector p2;
+    p2.SetXYZM(in[1].momentum.x, in[1].momentum.y, in[1].momentum.z, in[1].mass);
+    float acop = std::abs(p1.Phi() - p2.Phi());
+    if(acop > M_PI) acop = 2 * M_PI - acop;
+    acop = M_PI - acop;
+    return acop;
+}
