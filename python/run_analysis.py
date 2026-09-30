@@ -84,9 +84,18 @@ def create_condor_config(log_dir: str,
 
     cfg += '+JobFlavour      = "%s"\n' % get_element(rdf_module, 'batchQueue')
 
-    cfg += '+AccountingGroup = "%s"\n' % get_element(rdf_module, 'compGroup')
+    # HTCondor accounting group (hardcoded for SDCC).
+    # SDCC's schedd submit requirement checks the AcctGroup attribute, which is
+    # only set by the accounting_group / accounting_group_user submit commands
+    # (not by the raw +AccountingGroup ClassAd attribute).
+    cfg += 'accounting_group = group_usfcc.asmith4\n'
+    cfg += 'accounting_group_user = asmith4\n'
 
     cfg += 'RequestCpus      = %i\n' % get_element(rdf_module, "nCPUS")
+
+    request_memory = get_element(rdf_module, "batchMemory")
+    if request_memory:
+        cfg += 'RequestMemory    = %s\n' % request_memory
 
     cfg += 'queue filename matching files'
     for script in subjob_scripts:
@@ -126,14 +135,18 @@ def create_subjob_script(local_dir: str,
                     scr += line + '\n'
         scr += '\n\n'
 
-    scr += f'mkdir job_{process_name}_chunk_{chunk_num}\n'
+    # From here on any failing command fails the job. Without this the exit
+    # code of the job was that of the last line (the copy), so a crashed or
+    # killed fccanalysis could still be reported as a success.
+    scr += 'set -e -o pipefail\n'
+    scr += '[ -n "${KEY4HEP_STACK}" ] || '
+    scr += '{ echo "Key4hep stack not set up" >&2; exit 1; }\n\n'
+
+    scr += f'mkdir -p job_{process_name}_chunk_{chunk_num}\n'
     scr += f'cd job_{process_name}_chunk_{chunk_num}\n\n'
 
-    if not os.path.isabs(output_dir):
-        output_path = os.path.join(output_dir, f'chunk_{chunk_num}.root')
-    else:
-        output_path = os.path.join(output_dir, process_name,
-                                   f'chunk_{chunk_num}.root')
+    # Write into the job sandbox; only a finished, validated file is published.
+    output_path = f'chunk_{chunk_num}.root'
 
     scr += local_dir
     scr += f'/bin/fccanalysis run {anapath} --batch '
@@ -143,17 +156,25 @@ def create_subjob_script(local_dir: str,
         scr += f' {file_path}'
     scr += '\n\n'
 
-    if not os.path.isabs(output_dir) and output_dir_eos == '':
+    final_dest = None
+    if os.path.isabs(output_dir):
+        final_dest = os.path.join(output_dir, process_name,
+                                  f'chunk_{chunk_num}.root')
+    elif output_dir_eos == '':
         final_dest = os.path.join(local_dir, output_dir, process_name,
                                   f'chunk_{chunk_num}.root')
-        scr += f'cp {output_path} {final_dest}\n'
+    if final_dest is not None:
+        # Copy under a temporary name and rename, so that readers never see a
+        # half-written chunk (e.g. from a job that is killed or retried).
+        scr += f'cp {output_path} {final_dest}.part\n'
+        scr += f'mv -f {final_dest}.part {final_dest}\n'
 
     if output_dir_eos != '':
         final_dest = os.path.join(output_dir_eos,
                                   process_name,
                                   f'chunk_{chunk_num}.root')
         final_dest = f'root://{eos_type}.cern.ch/' + final_dest
-        scr += f'xrdcp {output_path} {final_dest}\n'
+        scr += f'xrdcp -f {output_path} {final_dest}\n'
 
     return scr
 
@@ -233,14 +254,23 @@ def submit_job(cmd: str, max_trials: int) -> bool:
                               universal_newlines=True) as proc:
             (stdout, stderr) = proc.communicate()
 
-            if proc.returncode == 0 and len(stderr) == 0:
+            # Success is decided by the exit code alone. condor_submit on SDCC
+            # writes advisory warnings to stderr on a perfectly good submit
+            # (accounting group, schedd policy, ...); treating any stderr as a
+            # failure made this retry a submission that had already succeeded,
+            # duplicating the cluster `max_trials` times and then aborting the
+            # whole process list.
+            if proc.returncode == 0:
                 LOGGER.info(stdout)
+                if stderr.strip():
+                    LOGGER.warning('condor_submit succeeded but wrote to '
+                                   'stderr:\n%s', stderr.strip())
                 LOGGER.info('GOOD SUBMISSION')
                 return True
 
             LOGGER.warning('Error while submitting, retrying...\n  '
-                           'Trial: %i / %i\n  Error: %s',
-                           i, max_trials, stderr)
+                           'Trial: %i / %i\n  Exit code: %i\n  Error: %s',
+                           i, max_trials, proc.returncode, stderr)
             time.sleep(10)
 
     LOGGER.error('Failed submitting after: %i trials!', max_trials)
@@ -347,9 +377,13 @@ def run_rdf(rdf_module,
 
 
 # _____________________________________________________________________________
-def send_to_batch(rdf_module, chunk_list, process, anapath: str):
+def send_to_batch(rdf_module, chunk_list, process, anapath: str) -> bool:
     '''
     Send jobs to HTCondor batch system.
+
+    Returns True on a successful submission. Failures are reported to the
+    caller instead of exiting, so that one bad process does not stop the
+    remaining processes in the process list from being submitted.
     '''
     local_dir = os.environ['LOCAL_DIR']
     current_date = datetime.datetime.fromtimestamp(
@@ -371,7 +405,7 @@ def send_to_batch(rdf_module, chunk_list, process, anapath: str):
     except subprocess.CalledProcessError:
         LOGGER.error('The FCCanalyses libraries are not properly build and '
                      'installed!\nAborting job submission...')
-        sys.exit(3)
+        return False
 
     subjob_scripts = []
     for ch in range(len(chunk_list)):
@@ -394,7 +428,7 @@ def send_to_batch(rdf_module, chunk_list, process, anapath: str):
                     LOGGER.warning('I/O error(%i): %s', e.errno, e.strerror)
                 else:
                     LOGGER.error('I/O error(%i): %s', e.errno, e.strerror)
-                    sys.exit(3)
+                    return False
             else:
                 break
             time.sleep(10)
@@ -417,7 +451,7 @@ def send_to_batch(rdf_module, chunk_list, process, anapath: str):
         except IOError as e:
             LOGGER.warning('I/O error(%i): %s', e.errno, e.strerror)
             if i == 2:
-                sys.exit(3)
+                return False
         else:
             break
         time.sleep(10)
@@ -425,9 +459,58 @@ def send_to_batch(rdf_module, chunk_list, process, anapath: str):
 
     batch_cmd = f'condor_submit {condor_config_path}'
     LOGGER.info('Batch command:\n  %s', batch_cmd)
-    success = submit_job(batch_cmd, 10)
-    if not success:
-        sys.exit(3)
+    return submit_job(batch_cmd, 10)
+
+
+# _____________________________________________________________________________
+def prepare_batch_output(rdf_module, process_name: str, chunk_list,
+                         nevents_per_file: dict) -> bool:
+    '''
+    Check that the batch output directory holds no chunks from an earlier
+    submission and write a manifest of the chunks the jobs must produce.
+
+    Downstream readers compare the directory against the manifest, so a job
+    that never finished (held, evicted, out of retries) is reported instead of
+    silently shrinking the sample, and stale chunks are never mixed in.
+    '''
+    output_dir = get_element(rdf_module, "outputDir")
+    if os.path.isabs(output_dir):
+        chunk_dir = os.path.join(output_dir, process_name)
+    elif get_element(rdf_module, "outputDirEos") == '':
+        local_dir = os.environ['LOCAL_DIR']
+        if "FCCAnalyses" not in os.environ:
+            local_dir = local_dir + "/FCCAnalyses"
+        chunk_dir = os.path.join(local_dir, output_dir, process_name)
+    else:
+        # Output only goes to EOS; nothing local to guard.
+        return True
+
+    os.makedirs(chunk_dir, exist_ok=True)
+
+    stale = sorted(f for f in os.listdir(chunk_dir)
+                   if f.endswith('.root') or f.endswith('.root.part'))
+    if stale:
+        LOGGER.error('Output directory for "%s" already contains %i file(s) '
+                     'from a previous submission:\n  %s\nRemove or move them '
+                     'before resubmitting, otherwise old and new chunks get '
+                     'mixed.', process_name, len(stale), chunk_dir)
+        return False
+
+    manifest = {
+        'process': process_name,
+        'chunks': {
+            f'chunk_{ch}.root': {
+                'input_files': [str(f) for f in chunk],
+                'input_events': int(sum(nevents_per_file[f] for f in chunk)),
+            }
+            for ch, chunk in enumerate(chunk_list)
+        },
+    }
+    manifest_path = os.path.join(chunk_dir, 'manifest.json')
+    with open(manifest_path, 'w', encoding='utf-8') as mfile:
+        json.dump(manifest, mfile, indent=2)
+    LOGGER.info('Wrote chunk manifest:\n  %s', manifest_path)
+    return True
 
 
 # _____________________________________________________________________________
@@ -518,6 +601,17 @@ def run_local(rdf_module, infile_list, args):
     start_time = time.time()
     inn, outn = run_rdf(rdf_module, file_list, outfile_path, args)
     elapsed_time = time.time() - start_time
+
+    # Every input event must have been read. A short read (e.g. an I/O error
+    # while streaming over xrootd) would otherwise produce a valid-looking
+    # file with fewer events.
+    if inn != nevents_local:
+        LOGGER.error('Processed %s events but the input files contain %s!\n'
+                     'Removing output and aborting...',
+                     f'{int(inn):,}', f'{nevents_local:,}')
+        if os.path.exists(outfile_path):
+            os.remove(outfile_path)
+        sys.exit(3)
     
     # replace nevents_local by inn = the amount of processed events
 
@@ -545,6 +639,10 @@ def run_local(rdf_module, infile_list, args):
                 nevents_orig if nevents_orig != 0 else inn)
         param.Write()
         param = ROOT.TParameter(int)('eventsSelected', outn)
+        param.Write()
+        # Entries read from this job's own input files (unlike
+        # eventsProcessed, which carries the first-stage count forward).
+        param = ROOT.TParameter(int)('eventsInput', inn)
         param.Write()
         outfile.Write()
 
@@ -621,6 +719,8 @@ def run_stages(args, rdf_module, anapath):
     # Check if the process list is specified
     process_list = get_element(rdf_module, 'processList')
 
+    failed_processes: list[str] = []
+
     for process_name in process_list:
         file_list, event_list = get_process_info(
             process_name,
@@ -628,8 +728,10 @@ def run_stages(args, rdf_module, anapath):
             get_element(rdf_module, "inputDir"))
 
         if len(file_list) <= 0:
-            LOGGER.error('No files to process!\nAborting...')
-            sys.exit(3)
+            LOGGER.error('No files to process for "%s"!\nSkipping...',
+                         process_name)
+            failed_processes.append(process_name)
+            continue
 
         # Determine the fraction of the input to be processed
         fraction = 1
@@ -675,7 +777,17 @@ def run_stages(args, rdf_module, anapath):
                 LOGGER.warning('\033[4m\033[1m\033[91mRunning on batch with '
                                'only one chunk might not be optimal\033[0m')
 
-            send_to_batch(rdf_module, chunk_list, process_name, anapath)
+            if not prepare_batch_output(rdf_module, process_name, chunk_list,
+                                        dict(zip(file_list, event_list))):
+                failed_processes.append(process_name)
+                continue
+
+            if not send_to_batch(rdf_module, chunk_list, process_name,
+                                 anapath):
+                LOGGER.error('Submission of process "%s" failed!\n'
+                             'Continuing with the remaining processes...',
+                             process_name)
+                failed_processes.append(process_name)
 
         else:
             # Running locally
@@ -687,6 +799,15 @@ def run_stages(args, rdf_module, anapath):
                 for index, chunk in enumerate(chunk_list):
                     args.output = f'{output_stem}/chunk{index}.root'
                     run_local(rdf_module, chunk, args)
+
+    if failed_processes:
+        LOGGER.error('The following %i of %i processes were NOT submitted:\n'
+                     ' - %s',
+                     len(failed_processes), len(process_list),
+                     '\n - '.join(failed_processes))
+        sys.exit(3)
+
+    LOGGER.info('All %i processes submitted successfully.', len(process_list))
 
 
 def run_histmaker(args, rdf_module, anapath):

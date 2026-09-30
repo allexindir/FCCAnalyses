@@ -76,7 +76,9 @@ def get_process_info_files(process: str, input_dir: str) -> tuple[list[str],
         eventlist.append(get_entries(filetest))
 
     if os.path.isdir(dirtest):
-        flist = glob.glob(dirtest+"/*.root")
+        # sorted: glob order is filesystem dependent, and it decides which
+        # input files end up together in a chunk
+        flist = sorted(glob.glob(dirtest+"/*.root"))
         for f in flist:
             filelist.append(f)
             eventlist.append(get_entries(f))
