@@ -141,6 +141,11 @@ def create_subjob_script(local_dir: str,
     scr += 'set -e -o pipefail\n'
     scr += '[ -n "${KEY4HEP_STACK}" ] || '
     scr += '{ echo "Key4hep stack not set up" >&2; exit 1; }\n\n'
+    
+    scr += 'if [ -z "$_CONDOR_SCRATCH_DIR" ]; then\n'
+    scr += '    echo "condor scratch directory not set" >&2;  exit\n'
+    scr += 'fi\n'
+    scr += 'cd $_CONDOR_SCRATCH_DIR\n'
 
     scr += f'mkdir -p job_{process_name}_chunk_{chunk_num}\n'
     scr += f'cd job_{process_name}_chunk_{chunk_num}\n\n'
@@ -149,7 +154,7 @@ def create_subjob_script(local_dir: str,
     output_path = f'chunk_{chunk_num}.root'
 
     scr += local_dir
-    scr += f'/bin/fccanalysis run {anapath} --batch '
+    scr += f'/bin/fccanalysis run {os.path.abspath(anapath)} --batch '
     scr += f'--output {output_path} '
     scr += '--files-list'
     for file_path in chunk_list[chunk_num]:
